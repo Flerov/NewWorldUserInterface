@@ -16,12 +16,18 @@
 #define MAPPING_NAME_TO  L"Global\\MySharedMemory"
 #define MAPPING_NAME_FROM L"Global\\VADSharedMemory"
 #define MAPPING_NAME_FROM_FILENAMES L"Global\\VADSharedMemoryFileNames"
+#define MAPPING_NOTIFICATION_LINK_EVENT L"Global\\LinkMemory"
+#define MAPPING_NOTIFICATION_Unlink_EVENT L"Global\\UnlinkMemory"
+#define MAPPING_NOTIFICATION_INIT_EVENT L"Global\\InitializeMemory"
+#define MAPPING_NOTIFICATION_USERMODEREADY_EVENT L"Global\\UserModeReadEvent"
 // -----------------------------------------------------------------
 
 typedef struct _INIT {
 	CHAR identifier[4];
 	CHAR sourceProcess[15];
 	CHAR targetProcess[15];
+	unsigned long long sourceVA;
+	unsigned long long targetVPN;
 	DWORD NtBaseOffset;
 	DWORD KPROCDirectoryTableBaseOffset;
 	DWORD EPROCActiveProcessLinksOfsset;
@@ -467,7 +473,6 @@ DWORD GetFieldOffset(symbol_ctx* ctx, LPCSTR struct_name, LPCWSTR field_name) {
 		break;
 	}
 	free(childrenParam);
-	//printf("Offset of %S in %s: 0x%llx\n", field_name, struct_name, offset);
 	return offset;
 }
 void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
@@ -549,7 +554,6 @@ unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD
 	}
 	memcpy(CurrSymbolInArray[SymbolsArrayIndex].name, std::move(str), strLen);
 	CurrSymbolInArray[SymbolsArrayIndex].offset = offset;
-	//printf("Inserted: %s at: 0x%llx\n", CurrSymbolInArray[SymbolsArrayIndex].name, CurrSymbolInArray[SymbolsArrayIndex].offset);
 
 	totalCopiedSize += strLen;
 	SymbolsArrayIndex++;
@@ -564,12 +568,10 @@ BOOL AddInitData(DWORD NtBaseOffset, DWORD KPROCDirectoryTableBaseOffset, DWORD 
 	if (sourceProcess != NULL) {
 		size_t copyLenSource = min(strlen(sourceProcess), sizeof(Data[0].sourceProcess) - 1);
 		memcpy(Data[0].sourceProcess, sourceProcess, copyLenSource);
-		//Data[0].targetProcess[15] = '\0'; // Ensure null-termination
 	}
 	if (targetProcess != NULL) {
 		size_t copyLenTarget = min(strlen(targetProcess), sizeof(Data[0].targetProcess) - 1);
 		memcpy(Data[0].targetProcess, targetProcess, copyLenTarget);
-		//Data[0].targetProcess[15] = '\0'; // Ensure null-termination
 	}
 	Data[0].KPROCDirectoryTableBaseOffset = KPROCDirectoryTableBaseOffset;
 	Data[0].EPROCActiveProcessLinksOfsset = EPROCActiveProcessLinksOfsset;
@@ -608,11 +610,8 @@ DWORD64 GetKernelBase(_In_ std::string name) {
 			sizeof(lpFileName) / sizeof(char)
 				);
 				// Compares the indexed driver and with our specified driver name
-				//printf("[DriverName] {%s} == {%s}\n", lpFileName, name.c_str());
 				if (!strcmp(name.c_str(), lpFileName)) {
 					imageBase = (DWORD64)lpImageBase[i];
-					//Logger::InfoHex("Found Image Base for " + name, imageBase);
-					//printf("Found Image Base for %s 0x%lu\n", name.c_str(), imageBase);
 					break;
 				}
 	}
@@ -744,6 +743,78 @@ void GetSymOffsets(PVOID SecBase, size_t SecSize,
 	return;
 }
 // -----------------------------------------------------------------
+void UpdateInitData(const char* sourceProcess,
+					const char* targetProcess,
+					unsigned long long sourceVA,
+					unsigned long long targetVPN) {
+	PINIT Data = (PINIT)SymbolsArray;
+	if (sourceProcess != NULL) {
+		size_t copyLenSource = min(strlen(sourceProcess), sizeof(Data[0].sourceProcess) - 1);
+		memcpy(Data[0].sourceProcess, sourceProcess, copyLenSource);
+		Data[0].sourceProcess[15] = '\0';
+	}
+	if (targetProcess != NULL) {
+		size_t copyLenTarget = min(strlen(targetProcess), sizeof(Data[0].targetProcess) - 1);
+		memcpy(Data[0].targetProcess, targetProcess, copyLenTarget);
+		Data[0].targetProcess[15] = '\0';
+	}
+	if (sourceVA != 0x0)
+		Data[0].sourceVA = sourceVA;
+	if (targetVPN != 0x0)
+		Data[0].targetVPN = targetVPN;
+	printf("[*] InitData updated successfully\n");
+}
+void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
+	if (sym_ctxNtskrnl == NULL) {
+		printf("Symbols for ntoskrnl.exe not available, download failed, aborting...\n");
+		exit(1);
+	}
+	unsigned long long ntBase = GetKernelBase("ntoskrnl.exe"); // DWORD64
+	unsigned long long eprocUniqueProcessId = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"UniqueProcessId");
+	unsigned long long eprocActiveProcessLinks = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ActiveProcessLinks");
+	unsigned long long kprocDirectoryTableBase = GetFieldOffset(sym_ctxNtskrnl, "_KPROCESS", L"DirectoryTableBase");// Parse command line arguments]
+
+	if (AddInitData(ntBase, kprocDirectoryTableBase, eprocActiveProcessLinks, eprocUniqueProcessId, 0x0, 0x0))
+		printf("[*] InitData added successfully\n");
+	//GetAndInsertSymbol("sourceVA", sym_ctxNtskrnl, (unsigned long long)sourceVA, true);
+	//GetAndInsertSymbol("targetVPN", sym_ctxNtskrnl, targetVPN, true);
+
+	GetAndInsertSymbol("eprocUniqueProcessId", sym_ctxNtskrnl, eprocUniqueProcessId, true); // TODO: exceution stops here???
+	GetAndInsertSymbol("eprocActiveProcessLinks", sym_ctxNtskrnl, eprocActiveProcessLinks, true);
+	GetAndInsertSymbol("kprocDirectoryTableBase", sym_ctxNtskrnl, kprocDirectoryTableBase, true);
+	unsigned long long VADRoot = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"VadRoot");
+	unsigned long long StartingVpn1 = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"StartingVpn");
+	unsigned long long EndingVpn1 = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"EndingVpn");
+	unsigned long long Left = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"Left");
+	unsigned long long Right = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"Right");
+	GetAndInsertSymbol("VADRoot", sym_ctxNtskrnl, VADRoot, true);
+	GetAndInsertSymbol("StartingVpn", sym_ctxNtskrnl, StartingVpn1, true);
+	GetAndInsertSymbol("EndingVpn", sym_ctxNtskrnl, EndingVpn1, true);
+	GetAndInsertSymbol("Left", sym_ctxNtskrnl, Left, true);
+	GetAndInsertSymbol("Right", sym_ctxNtskrnl, Right, true);
+	unsigned long long MMVADSubsection = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"Subsection");
+	unsigned long long MMVADControlArea = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"ControlArea"); // actually at Off: 0x0 and its _CONTROL_AREA*
+	unsigned long long MMVADCAFilePointer = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"FilePointer");
+	unsigned long long FILEOBJECTFileName = GetFieldOffset(sym_ctxNtskrnl, "_FILE_OBJECT", L"FileName");
+	GetAndInsertSymbol("MMVADSubsection", sym_ctxNtskrnl, MMVADSubsection, true);
+	GetAndInsertSymbol("MMVADControlArea", sym_ctxNtskrnl, MMVADControlArea, true);
+	GetAndInsertSymbol("MMVADCAFilePointer", sym_ctxNtskrnl, MMVADCAFilePointer, true);
+	GetAndInsertSymbol("FILEOBJECTFileName", sym_ctxNtskrnl, FILEOBJECTFileName, true);
+	unsigned long long EPROCImageFileName = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ImageFileName");
+	GetAndInsertSymbol("EPROCImageFileName", sym_ctxNtskrnl, EPROCImageFileName, true);
+	unsigned long long PEB = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"Peb");
+	unsigned long long PEBLdr = GetFieldOffset(sym_ctxNtskrnl, "_PEB", L"Ldr");
+	unsigned long long LdrListHead = GetFieldOffset(sym_ctxNtskrnl, "_PEB_LDR_DATA", L"InMemoryOrderModuleList");
+	unsigned long long LdrListEntry = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"InMemoryOrderLinks");
+	unsigned long long LdrBaseDllName = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"BaseDllName");
+	unsigned long long LdrBaseDllBase = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"DllBase");
+	GetAndInsertSymbol("PEB", sym_ctxNtskrnl, PEB, true);
+	GetAndInsertSymbol("PEBLdr", sym_ctxNtskrnl, PEBLdr, true);
+	GetAndInsertSymbol("LdrListHead", sym_ctxNtskrnl, LdrListHead, true);
+	GetAndInsertSymbol("LdrListEntry", sym_ctxNtskrnl, LdrListEntry, true);
+	GetAndInsertSymbol("LdrBaseDllName", sym_ctxNtskrnl, LdrBaseDllName, true);
+	GetAndInsertSymbol("LdrBaseDllBase", sym_ctxNtskrnl, LdrBaseDllBase, true);
+}
 int main(int argc, char* argv[]) {
 	// Section to send Symbol Info to Driver
 	LPTSTR ntoskrnlPath;
@@ -752,27 +823,18 @@ int main(int argc, char* argv[]) {
 	ntoskrnlPath = g_ntoskrnlPath;
 	symbol_ctx* sym_ctxNtskrnl = LoadSymbolsFromImageFile(ntoskrnlPath);
 
-	if (sym_ctxNtskrnl == NULL) {
-		printf("Symbols for ntoskrnl.exe not available, download failed, aborting...\n");
-		exit(1);
-	}
-	//printf("ntoskrnl pdb base addr: %llx\n", sym_ctxNtskrnl->pdb_base_addr);
-	//printf("ntoskrnl pdb name: %ls\n", sym_ctxNtskrnl->pdb_name_w);
-	//printf("ntoskrnl sym handle: %p\n", sym_ctxNtskrnl->sym_handle);
-
 	size_t NumSymbols = 7; // TODO Handle mapping size, currently its so few we'll stay below 1 page 4096 Bytes
 	SymbolsArrayAllocationSize = sizeof(INIT);
 	SymbolsArrayAllocationSize += NumSymbols * sizeof(SYMBOL); // TODO: Change to new Var: TotalAllocationSize
-	//printf("[*] Requesting %zu Bytes of Memory\n", SymbolsArrayAllocationSize);
-	//auto start = std::chrono::high_resolution_clock::now();
 
-	HANDLE hMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SymbolsArrayAllocationSize, MAPPING_NAME_TO);
+	//HANDLE hMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SymbolsArrayAllocationSize, MAPPING_NAME_TO);
+	HANDLE hMapFile = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_TO);
 	if (!hMapFile) {
 		printf("[-] Failed to create file mapping: %d", GetLastError());
 		return 1;
 	}
 
-	SymbolsArray = (VOID*)MapViewOfFile(hMapFile, FILE_MAP_WRITE, 0, 0, SymbolsArrayAllocationSize);
+	SymbolsArray = (VOID*)MapViewOfFile(hMapFile, FILE_MAP_WRITE, 0, 0, 4096 * 2);
 	if (!SymbolsArray) {
 		printf("[-] Failed to map view of file: %d\n", GetLastError());
 		CloseHandle(hMapFile);
@@ -785,17 +847,21 @@ int main(int argc, char* argv[]) {
 	}
 	totalAllocationSize += SymbolsArrayAllocationSize;
 
-	unsigned long long ntBase = GetKernelBase("ntoskrnl.exe"); // DWORD64
-	unsigned long long eprocUniqueProcessId = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"UniqueProcessId");
-	unsigned long long eprocActiveProcessLinks = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ActiveProcessLinks");
-	unsigned long long kprocDirectoryTableBase = GetFieldOffset(sym_ctxNtskrnl, "_KPROCESS", L"DirectoryTableBase");// Parse command line arguments]
 	const char* targetProcess = NULL;
 	const char* sourceProcess = NULL;
 	unsigned long long targetVPN = NULL;
 	unsigned long long targetVPNOffset = NULL;
 	size_t targetVPNSize = 0;
-	PVOID sourceVA = NULL;
+	volatile PVOID sourceVA = NULL;
 	sourceVA = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (sourceVA != NULL) {
+		// Force physical allocation by touching every page (here: only one page)
+		VirtualLock(sourceVA, 4096); // Lock the page in memory
+		memset(sourceVA, 0x41, 4096); // Fill the page with 'A's
+		printf("[*] Force physical allocation at: 0x%llx\n", (unsigned long long)sourceVA);
+		// print the first 10 bytes of the allocated memory
+		CheckModifiedMemory(sourceVA, 10);
+	}
 	printf("[*] Allocated memory at: 0x%llx\n", sourceVA);
 	for (int i = 1; i < argc; i++) {
 		// SET TARGET PROCESS
@@ -867,77 +933,73 @@ int main(int argc, char* argv[]) {
 	if (targetVPN != NULL) {
 		targetVPN += targetVPNOffset;
 	}
-	if (AddInitData(ntBase, kprocDirectoryTableBase, eprocActiveProcessLinks, eprocUniqueProcessId, sourceProcess, targetProcess))
-		printf("[*] InitData added successfully\n");
-	GetAndInsertSymbol("sourceVA", sym_ctxNtskrnl, (unsigned long long)sourceVA, true);
-	GetAndInsertSymbol("targetVPN", sym_ctxNtskrnl, targetVPN, true);
-
-	GetAndInsertSymbol("eprocUniqueProcessId", sym_ctxNtskrnl, eprocUniqueProcessId, true);
-	GetAndInsertSymbol("eprocActiveProcessLinks", sym_ctxNtskrnl, eprocActiveProcessLinks, true);
-	GetAndInsertSymbol("kprocDirectoryTableBase", sym_ctxNtskrnl, kprocDirectoryTableBase, true);
-	unsigned long long VADRoot = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"VadRoot");
-	unsigned long long StartingVpn1 = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"StartingVpn");
-	unsigned long long EndingVpn1 = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"EndingVpn");
-	unsigned long long Left = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"Left");
-	unsigned long long Right = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"Right");
-	GetAndInsertSymbol("VADRoot", sym_ctxNtskrnl, VADRoot, true);
-	GetAndInsertSymbol("StartingVpn", sym_ctxNtskrnl, StartingVpn1, true);
-	GetAndInsertSymbol("EndingVpn", sym_ctxNtskrnl, EndingVpn1, true);
-	GetAndInsertSymbol("Left", sym_ctxNtskrnl, Left, true);
-	GetAndInsertSymbol("Right", sym_ctxNtskrnl, Right, true);
-	unsigned long long MMVADSubsection = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"Subsection");
-	unsigned long long MMVADControlArea = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"ControlArea"); // actually at Off: 0x0 and its _CONTROL_AREA*
-	unsigned long long MMVADCAFilePointer = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"FilePointer");
-	unsigned long long FILEOBJECTFileName = GetFieldOffset(sym_ctxNtskrnl, "_FILE_OBJECT", L"FileName");
-	GetAndInsertSymbol("MMVADSubsection", sym_ctxNtskrnl, MMVADSubsection, true);
-	GetAndInsertSymbol("MMVADControlArea", sym_ctxNtskrnl, MMVADControlArea, true);
-	GetAndInsertSymbol("MMVADCAFilePointer", sym_ctxNtskrnl, MMVADCAFilePointer, true);
-	GetAndInsertSymbol("FILEOBJECTFileName", sym_ctxNtskrnl, FILEOBJECTFileName, true);
-	unsigned long long EPROCImageFileName = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ImageFileName");
-	GetAndInsertSymbol("EPROCImageFileName", sym_ctxNtskrnl, EPROCImageFileName, true);
-	unsigned long long PEB = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"Peb");
-	unsigned long long PEBLdr = GetFieldOffset(sym_ctxNtskrnl, "_PEB", L"Ldr");
-	unsigned long long LdrListHead = GetFieldOffset(sym_ctxNtskrnl, "_PEB_LDR_DATA", L"InMemoryOrderModuleList");
-	unsigned long long LdrListEntry = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"InMemoryOrderLinks");
-	unsigned long long LdrBaseDllName = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"BaseDllName");
-	unsigned long long LdrBaseDllBase = GetFieldOffset(sym_ctxNtskrnl, "_LDR_DATA_TABLE_ENTRY", L"DllBase");
-	GetAndInsertSymbol("PEB", sym_ctxNtskrnl, PEB, true);
-	GetAndInsertSymbol("PEBLdr", sym_ctxNtskrnl, PEBLdr, true);
-	GetAndInsertSymbol("LdrListHead", sym_ctxNtskrnl, LdrListHead, true);
-	GetAndInsertSymbol("LdrListEntry", sym_ctxNtskrnl, LdrListEntry, true);
-	GetAndInsertSymbol("LdrBaseDllName", sym_ctxNtskrnl, LdrBaseDllName, true);
-	GetAndInsertSymbol("LdrBaseDllBase", sym_ctxNtskrnl, LdrBaseDllBase, true);
-	UnloadSymbols(sym_ctxNtskrnl, false);
 	// -----------------------------------------------------------------
 	// Section for Info from Driver
-	HANDLE hVADMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, MAPPING_NAME_FROM);
+	//HANDLE hVADMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, MAPPING_NAME_FROM);
+	HANDLE hVADMapFile = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_FROM);
 	if (!hVADMapFile) {
 		printf("[-] Failed to create VAD file mapping: %d\n", GetLastError());
 		return 1;
 	}
+	printf("[*] MAPPING_NAME_FROM VAD file mapping created successfully\n");
 
-	PVOID VADArray = (VOID*)MapViewOfFile(hVADMapFile, FILE_MAP_READ, 0, 0, 4096);
+	PVOID VADArray = (VOID*)MapViewOfFile(hVADMapFile, FILE_MAP_WRITE, 0, 0, 4096 * 3);
 	if (!VADArray) {
 		printf("[-] Failed to map VAD file mapping: %d\n", GetLastError());
 		CloseHandle(hVADMapFile);
 		return 1;
 	}
-	//printf("[*] VAD file mapping created successfully | At: 0x%llx\n", VADArray);
 	// -----------------------------------------------------------------
 	// Section for FileName-Info from Driver
-	HANDLE hVADMapFileName = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096 * 2, MAPPING_NAME_FROM_FILENAMES);
+	//HANDLE hVADMapFileName = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096 * 2, MAPPING_NAME_FROM_FILENAMES);
+	HANDLE hVADMapFileName = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_FROM_FILENAMES);
 	if (!hVADMapFileName) {
 		printf("[-] Failed to create VAD file mapping: %d\n", GetLastError());
 		return 1;
 	}
-	PVOID VADArrayFileName = (VOID*)MapViewOfFile(hVADMapFileName, FILE_MAP_READ, 0, 0, 4096 * 2);
+	printf("[*] MAPPING_NAME_FROM_FILENAMES VAD file mapping created successfully\n");
+	PVOID VADArrayFileName = (VOID*)MapViewOfFile(hVADMapFileName, FILE_MAP_WRITE, 0, 0, 4096 * 2); // should be 2 * 4096??? TODO:
 	if (!VADArrayFileName) {
 		printf("[-] Failed to map VAD file mapping: %d\n", GetLastError());
 		CloseHandle(hVADMapFileName);
 		return 1;
 	}
-	//printf("[*] VAD filename mapping created successfully | At: 0x%llx\n", VADArrayFileName);
 
+	// TEST START
+	//HANDLE hEvent = CreateEventW(
+	//	NULL, FALSE, FALSE, MAPPING_NOTIFICATION_EVENT);
+	HANDLE hEventUSERMODEREADY = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_USERMODEREADY_EVENT);
+	if (hEventUSERMODEREADY == NULL) {
+		printf("[-] Failed to create event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NOTIFICATION_USERMODEREADY_EVENT event opened successfully\n");
+	// TEST END
+	// TEST START
+	HANDLE hEventLINK = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_LINK_EVENT);
+	if (hEventLINK == NULL) {
+		printf("[-] Failed to create event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NOTIFICATION_LINK_EVENT event opened successfully\n");
+	// TEST END
+	// TEST START
+	HANDLE hEventUnlink = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_Unlink_EVENT);
+	if (hEventUnlink == NULL) {
+		printf("[-] Failed to create event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NOTIFICATION_Unlink_EVENT event opened successfully\n");
+	// TEST END
+	// TEST START
+	HANDLE hEventINIT = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_INIT_EVENT);
+	if (hEventINIT == NULL) {
+		printf("[-] Failed to open event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NOTIFICATION_INIT_EVENT event opened successfully\n");
+	// TEST END
+	
 	printf("\n[*] Press 'c' to check VAD offsets");
 	printf("\n[*] Press 'y' to check memory at source VA");
 	printf("\n[*] Press 'x' to exit\n");
@@ -957,7 +1019,34 @@ int main(int argc, char* argv[]) {
 		case 'x':
 		case 'X':
 			printf("Exiting program...\n");
+			VirtualUnlock(sourceVA, 4096); // Lock the page in memory
 			running = false;
+			break;
+
+		case 'a':
+		case 'A':
+			RtlZeroMemory(VADArray, 4096 * 3);
+			RtlZeroMemory(VADArrayFileName, 4096 * 2);
+			if (targetProcess != NULL) {
+				if (SetEvent(hEventUSERMODEREADY)) { // TODO: Should all be CLI controlled? Like this we will always buffer the VAD-Tree
+					printf("[*] Event set successfully\n");
+				}
+				else {
+					printf("[-] Failed to set event: %d\n", GetLastError());
+				}
+			}
+			break;
+
+		case 'b':
+		case 'B':
+			if (targetVPN != NULL && sourceProcess != NULL) {
+				if (SetEvent(hEventLINK)) { // TODO: Should all be CLI controlled? Like this we will Link
+					printf("[*] Event set successfully\n");
+				}
+				else {
+					printf("[-] Failed to set event: %d\n", GetLastError());
+				}
+			}
 			break;
 
 		case 'c':
@@ -966,12 +1055,30 @@ int main(int argc, char* argv[]) {
 			GetSymOffsets(VADArray, 4096, VADArrayFileName, 4096 * 2);
 			break;
 
+		case 'i':
+		case 'I':
+			AddInitDataSection(sym_ctxNtskrnl);
+			break;
+		case 'u':
+		case 'U':
+			UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+			if (SetEvent(hEventINIT)) {
+				printf("[*] Event set successfully\n");
+			}
+			else {
+				printf("[-] Failed to set event: %d\n", GetLastError());
+			}
+			break;
+
 		case 'y':
 		case 'Y':
 			printf("Checking memory at source VA:\n");
-			//CheckModifiedMemory(sourceVA, 4096);
 			CheckModifiedMemory(sourceVA, targetVPNSize);
 			break;
+
+		//case 'u':
+		//case 'U':
+		//	break;
 
 		case '\n':
 		case '\r':  // Handle Enter presses
@@ -985,24 +1092,33 @@ int main(int argc, char* argv[]) {
 
 cleanup:
 	// Cleanup code
-	if (VADArray) {
-		UnmapViewOfFile(VADArray);
-	}
-	if (hVADMapFile) {
-		CloseHandle(hVADMapFile);
-	}
-	if (VADArrayFileName) {
-		UnmapViewOfFile(VADArrayFileName);
-	}
-	if (hVADMapFileName) {
-		CloseHandle(hVADMapFileName);
-	}
-	if (SymbolsArray) {
-		UnmapViewOfFile(SymbolsArray);
-	}
-	if (hMapFile) {
-		CloseHandle(hMapFile);
-	}
+	//if (VADArray) {
+	//	UnmapViewOfFile(VADArray);
+	//}
+	//if (hVADMapFile) {
+	//	CloseHandle(hVADMapFile);
+	//}
+	//if (VADArrayFileName) {
+	//	UnmapViewOfFile(VADArrayFileName);
+	//}
+	//if (hVADMapFileName) {
+	//	CloseHandle(hVADMapFileName);
+	//}
+	//if (SymbolsArray) {
+	//	UnmapViewOfFile(SymbolsArray);
+	//}
+	//if (hMapFile) {
+	//	CloseHandle(hMapFile);
+	//}
+	//printf("Unlink memory at source VA:\n");
+	//if (SetEvent(hEventUnlink)) {
+	//	printf("[*] Event set successfully\n");
+	//}
+	//else {
+	//	printf("[-] Failed to set event: %d\n", GetLastError());
+	//}
+	//printf("[*] Cleanup symbol_ctx (NOT)\n");
+	//UnloadSymbols(sym_ctxNtskrnl, false); // TODO: This has to be properly Unloaded
 
 	return 0;
 }
