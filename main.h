@@ -1,6 +1,7 @@
 #pragma once
 #include <ntdef.h>
 #include <ntddk.h>
+//#include <wdmsec.h> // For SDDL definitions
 
 
 // =================================================================
@@ -90,6 +91,8 @@ typedef struct _INIT {
 	CHAR identifier[4];
 	CHAR sourceProcess[15];
 	CHAR targetProcess[15];
+	unsigned long long sourceVA;
+	unsigned long long targetVPN;
 	DWORD NtBaseOffset;
 	DWORD KPROCDirectoryTableBaseOffset;
 	DWORD EPROCActiveProcessLinksOfsset;
