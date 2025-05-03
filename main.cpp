@@ -388,7 +388,7 @@ symbol_ctx* LoadSymbolsFromPE(PE* pe) {
 	//if (!SymInitialize(cp, NULL, FALSE)) {
 	if (!SymInitializeW(cp, ctx->pdb_name_w, FALSE)) {
 		//if (!SymInitializeW(cp, ctx->pdb_name_w, FALSE)) {
-		printf("Failed SymInitialize\n");
+		printf("[-] Failed SymInitialize\n");
 		free(ctx);
 		return NULL;
 	}
@@ -404,10 +404,10 @@ symbol_ctx* LoadSymbolsFromPE(PE* pe) {
 	while (pdb_base_addr == 0) {
 		DWORD err = GetLastError();
 		if (err == ERROR_SUCCESS)
-			printf("Success\n");
+			printf("[+] Success\n");
 		break;
 		if (err == ERROR_FILE_NOT_FOUND) {
-			printf("PDB file not found\n");
+			printf("[-] PDB file not found\n");
 			SymUnloadModule(cp, asked_pdb_base_addr);//TODO : fix handle leak
 			SymCleanup(cp);
 			free(ctx);
@@ -418,7 +418,7 @@ symbol_ctx* LoadSymbolsFromPE(PE* pe) {
 		pdb_base_addr = SymLoadModuleExW(cp, NULL, ctx->pdb_name_w, NULL, (DWORD64)pe->baseAddress, pdb_image_size, NULL, 0);
 	}
 	ctx->pdb_base_addr = pdb_base_addr;
-	printf("PDB base address: 0x%llx\n", ctx->pdb_base_addr);
+	printf("[*] PDB base address: 0x%llx\n", ctx->pdb_base_addr);
 	return ctx;
 }
 
@@ -438,24 +438,24 @@ DWORD GetFieldOffset(symbol_ctx* ctx, LPCSTR struct_name, LPCWSTR field_name) {
 	BOOL res = SymGetTypeFromName(ctx->sym_handle, ctx->pdb_base_addr, struct_name, &si.si);
 	if (!res) {
 		DWORD err = GetLastError();
-		printf("SymGetTypeFromName failed: sym_handle: 0x%llx, pdb_base_addr: 0x%llx, struct_name: %s, Err: %d\n", ctx->sym_handle, ctx->pdb_base_addr, struct_name, err);
+		printf("[-] SymGetTypeFromName failed: sym_handle: 0x%llx, pdb_base_addr: 0x%llx, struct_name: %s, Err: %d\n", ctx->sym_handle, ctx->pdb_base_addr, struct_name, err);
 		return 0;
 	}
 
 	TI_FINDCHILDREN_PARAMS* childrenParam = (TI_FINDCHILDREN_PARAMS*)calloc(1, sizeof(TI_FINDCHILDREN_PARAMS));
 	if (childrenParam == NULL) {
-		printf("calloc failed\n");
+		printf("[-] calloc failed\n");
 		return 0;
 	}
 
 	res = SymGetTypeInfo(ctx->sym_handle, ctx->pdb_base_addr, si.si.TypeIndex, TI_GET_CHILDRENCOUNT, &childrenParam->Count);
 	if (!res) {
-		printf("SymGetTypeInfo failed\n");
+		printf("[-] SymGetTypeInfo failed\n");
 		return 0;
 	}
 	TI_FINDCHILDREN_PARAMS* ptr = (TI_FINDCHILDREN_PARAMS*)realloc(childrenParam, sizeof(TI_FINDCHILDREN_PARAMS) + childrenParam->Count * sizeof(ULONG));
 	if (ptr == NULL) {
-		printf("realloc failed\n");
+		printf("[-] realloc failed\n");
 		free(childrenParam);
 		return 0;
 	}
@@ -483,7 +483,7 @@ void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
 	if (ctx->sym_handle != NULL && ctx->pdb_base_addr != 0) {
 		// Only unload this specific module
 		if (!SymUnloadModule(ctx->sym_handle, ctx->pdb_base_addr)) {
-			printf("SymUnloadModule failed: %d\n", GetLastError());
+			printf("[-] SymUnloadModule failed: %d\n", GetLastError());
 		}
 
 		// Don't call SymCleanup here - it terminates the symbol handler
@@ -507,7 +507,7 @@ void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
 void CleanupSymbolHandler(HANDLE symHandle) {
 	if (symHandle != NULL) {
 		if (!SymCleanup(symHandle)) {
-			printf("SymCleanup failed: %d\n", GetLastError());
+			printf("[-] SymCleanup failed: %d\n", GetLastError());
 		}
 	}
 }
@@ -522,7 +522,7 @@ DWORD64 GetSymbolOffset(symbol_ctx* ctx, LPCSTR symbol_name) {
 	}
 	else {
 		DWORD err = GetLastError();
-		printf("SymFromName failed for '%s': error %d (0x%x)\n", symbol_name, err, err);
+		printf("[-] SymFromName failed for '%s': error %d (0x%x)\n", symbol_name, err, err);
 
 		// Try as a type (for backward compatibility)
 		SYMBOL_INFO_PACKAGE si = { 0 };
@@ -540,11 +540,11 @@ DWORD64 GetSymbolOffset(symbol_ctx* ctx, LPCSTR symbol_name) {
 unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD64 offset, BOOLEAN useOffset) {
 	size_t strLen = strlen(str);
 	if (strLen >= 32) {
-		printf("Maximum string size reached...\n");
+		printf("[-] Maximum string size reached...\n");
 		return 0x0;
 	}
 	if (SymbolsArrayIndex >= SymbolsArrayAllocationSize) {
-		printf("Maximum reached...\n");
+		printf("[-] Maximum reached...\n");
 		return 0x0;
 	}
 	PSYMBOL CurrSymbolInArray = (PSYMBOL)((PINIT)SymbolsArray + sizeof(INIT));
@@ -596,7 +596,7 @@ DWORD64 GetKernelBase(_In_ std::string name) {
 	// Makes sure that we successfully grabbed the drivers
 	if (!success)
 	{
-		printf("Unable to invoke EnumDeviceDrivers()!\n");
+		printf("[-] Unable to invoke EnumDeviceDrivers()!\n");
 		return 0;
 	}
 	// Defining number of drivers for GetDeviceDriverBaseNameA()
@@ -648,24 +648,24 @@ void HexDump(void* pMemory, size_t size) {
 // -----------------------------------------------------------------
 void CheckModifiedMemory(PVOID address, size_t size) {
 	PVOID base = (PVOID)((unsigned long long)address & 0xfffffffffffff000);
-	printf("Checking memory at base: 0x%p\n", base);
+	printf("[+] Checking memory at base: 0x%p\n", base);
 
 	// Just read, don't modify permissions with VirtualProtect
 	MEMORY_BASIC_INFORMATION mbi;
 	if (VirtualQuery(base, &mbi, sizeof(mbi))) {
-		printf("Memory protection: 0x%lx\n", mbi.Protect);
-		printf("Memory state: %s\n",
+		printf("\t.. Memory protection: 0x%lx\n", mbi.Protect);
+		printf("\t.. Memory state: %s\n",
 			mbi.State == MEM_COMMIT ? "COMMIT" :
 			mbi.State == MEM_RESERVE ? "RESERVE" : "FREE");
 	}
 
 	// Read directly from memory without changing permissions
 	__try {
-		printf("Memory content (first 16 bytes):\n");
+		printf("\t.. Memory content (first 16 bytes):\n");
 		unsigned char* p = (unsigned char*)base;
 
 		for (size_t i = 0; i < size; i += 16) {  // Process 16 bytes per line
-			printf("%08X  ", (unsigned int)i);   // Print offset
+			printf("\t\t%08X  ", (unsigned int)i);   // Print offset
 
 			// Print hex bytes
 			for (size_t j = 0; j < 16; j++) {
@@ -689,7 +689,7 @@ void CheckModifiedMemory(PVOID address, size_t size) {
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
-		printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
+		printf("[-] Exception when reading memory: 0x%lx\n", GetExceptionCode());
 	}
 }
 // -----------------------------------------------------------------
@@ -815,6 +815,20 @@ void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
 	GetAndInsertSymbol("LdrBaseDllName", sym_ctxNtskrnl, LdrBaseDllName, true);
 	GetAndInsertSymbol("LdrBaseDllBase", sym_ctxNtskrnl, LdrBaseDllBase, true);
 }
+
+void ShowHelp() {
+	printf("---------------------------------------------------------------\n");
+	printf("[*] Press '1' to populate VAD-Tree\n");
+	printf("[*] Press '2' to check VAD offsets\n");
+	printf("[*] Press '3' to check memory at source VA\n");
+	printf("[*] Press '4' to link to VAD-Tree Node\n");
+	printf("[*] Press '5' to exit with cleanup\n");
+	printf("[*] Press '6' to exit silently (no cleanup)\n");
+	printf("[*] Press 'U' to update target VPN\n");
+	printf("[*] Press 'I' to update source process\n");
+	printf("[*] Press 'O' to update target process\n");
+}
+
 int main(int argc, char* argv[]) {
 	// Section to send Symbol Info to Driver
 	LPTSTR ntoskrnlPath;
@@ -856,7 +870,7 @@ int main(int argc, char* argv[]) {
 	sourceVA = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if (sourceVA != NULL) {
 		// Force physical allocation by touching every page (here: only one page)
-		VirtualLock(sourceVA, 4096); // Lock the page in memory
+		//VirtualLock(sourceVA, 4096); // Lock the page in memory
 		memset(sourceVA, 0x41, 4096); // Fill the page with 'A's
 		printf("[*] Force physical allocation at: 0x%llx\n", (unsigned long long)sourceVA);
 		// print the first 10 bytes of the allocated memory
@@ -999,15 +1013,31 @@ int main(int argc, char* argv[]) {
 	}
 	printf("[*] MAPPING_NOTIFICATION_INIT_EVENT event opened successfully\n");
 	// TEST END
-	
-	printf("\n[*] Press 'c' to check VAD offsets");
-	printf("\n[*] Press 'y' to check memory at source VA");
-	printf("\n[*] Press 'x' to exit\n");
+	AddInitDataSection(sym_ctxNtskrnl);
+	UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+	if (SetEvent(hEventINIT)) {
+		printf("[*] Send User-Mode Update to Kernel\n");
+	}
+	else {
+		printf("[-] Failed to set event: %d\n", GetLastError());
+	}
 
+	ShowHelp();
+
+	char buffer[64] = { 0 };
+	int index = 1;
+	int nextChar;
+	char* endPtr = NULL;
+	unsigned long long newTargetVPN = 0;
+
+	char procNameBufferSource[32] = { 0 };
+	char procNameBufferTarget[32] = { 0 };
+	int procNameIndex = 0;
+	int inputChar;
 	// More robust command loop implementation
 	bool running = true;
 	while (running) {
-		printf("\nEnter command (c, y, x): ");
+		printf("\nEnter command: ");
 		fflush(stdout);  // Ensure the prompt is displayed
 
 		// Read a single character
@@ -1016,76 +1046,219 @@ int main(int argc, char* argv[]) {
 
 		// Process the command
 		switch (ch) {
-		case 'x':
-		case 'X':
-			printf("Exiting program...\n");
-			VirtualUnlock(sourceVA, 4096); // Lock the page in memory
-			running = false;
-			break;
-
-		case 'a':
-		case 'A':
+		case '1':
 			RtlZeroMemory(VADArray, 4096 * 3);
 			RtlZeroMemory(VADArrayFileName, 4096 * 2);
 			if (targetProcess != NULL) {
 				if (SetEvent(hEventUSERMODEREADY)) { // TODO: Should all be CLI controlled? Like this we will always buffer the VAD-Tree
-					printf("[*] Event set successfully\n");
+					printf("[*] Notified driver to populate VAD-Tree\n");
 				}
 				else {
-					printf("[-] Failed to set event: %d\n", GetLastError());
+					printf("[-] Failed to notified driver to populate VAD-Tree: %d\n", GetLastError());
 				}
 			}
 			break;
-
-		case 'b':
-		case 'B':
-			if (targetVPN != NULL && sourceProcess != NULL) {
-				if (SetEvent(hEventLINK)) { // TODO: Should all be CLI controlled? Like this we will Link
-					printf("[*] Event set successfully\n");
-				}
-				else {
-					printf("[-] Failed to set event: %d\n", GetLastError());
-				}
-			}
-			break;
-
-		case 'c':
-		case 'C':
-			printf("Checking VAD offsets:\n");
+		case '2':
+			printf("[*] VAD offsets:\n");
 			GetSymOffsets(VADArray, 4096, VADArrayFileName, 4096 * 2);
 			break;
-
-		case 'i':
-		case 'I':
-			AddInitDataSection(sym_ctxNtskrnl);
-			break;
-		case 'u':
-		case 'U':
-			UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
-			if (SetEvent(hEventINIT)) {
-				printf("[*] Event set successfully\n");
+		case '3':
+			printf("[*] Memory at source VA:\n");
+			if (targetVPNSize == 0) {
+				targetVPNSize = 4096; // Default size if not set
 			}
-			else {
-				printf("[-] Failed to set event: %d\n", GetLastError());
-			}
-			break;
-
-		case 'y':
-		case 'Y':
-			printf("Checking memory at source VA:\n");
 			CheckModifiedMemory(sourceVA, targetVPNSize);
 			break;
+		case '4':
+			//if (targetVPN != NULL && sourceProcess != NULL) {
+				if (SetEvent(hEventLINK)) { // TODO: Should all be CLI controlled? Like this we will Link
+					printf("[*] Notified driver to link to VAD-Tree Node\n");
+				}
+				else {
+					printf("[-] Failed to notified driver to link to VAD-Tree Node: %d\n", GetLastError());
+				}
+			//}
+			break;
+		case '5':
+			printf("[*] Exiting program with cleanup...\n");
+			running = false;
+			break;
+		case '6':
+			// silen exit
+			printf("[*] Exiting program silently...\n");
+			return 0;
+		case 'u':
+		case 'U':
+			// SCAN FOR TARGET VPN UPDATE
 
-		//case 'u':
-		//case 'U':
-		//	break;
+			// Read additional characters for a multi-character hex number
+			index = 0;
+			printf("Continue entering hex value (press Enter when done): ");
+
+			// Continue reading until Enter is pressed
+			nextChar;
+			while ((nextChar = _getch()) != '\r' && nextChar != '\n') {
+				// Only accept valid hex characters (0-9, a-f, A-F) and control characters
+				if ((nextChar >= '0' && nextChar <= '9') ||
+					(nextChar >= 'a' && nextChar <= 'f') ||
+					(nextChar >= 'A' && nextChar <= 'F') ||
+					nextChar == 'x' || nextChar == 'X' ||
+					nextChar == '\b') {
+
+					if (nextChar == '\b') {
+						// Handle backspace - remove last character
+						if (index > 0) {
+							buffer[--index] = '\0';
+							printf("\b \b"); // Erase last character from display
+						}
+					}
+					else if (index < sizeof(buffer) - 1) {
+						// Add character to buffer and echo it
+						buffer[index++] = (char)nextChar;
+						printf("%c", nextChar);
+					}
+				}
+			}
+
+			printf("\n");
+			buffer[index] = '\0';
+
+			// Try to convert the buffer to a number
+			endPtr = NULL;
+			newTargetVPN = 0;
+
+			// Handle both "0x" prefix and no prefix
+			if (strncmp(buffer, "0x", 2) == 0 || strncmp(buffer, "0X", 2) == 0) {
+				newTargetVPN = strtoull(buffer + 2, &endPtr, 16);
+			}
+			else {
+				newTargetVPN = strtoull(buffer, &endPtr, 16);
+			}
+
+			// Validate the conversion
+			if (endPtr != buffer && *endPtr == '\0') {
+				// Conversion succeeded
+				targetVPN = newTargetVPN;
+				printf("[*] Target VPN updated to: 0x%llx\n", targetVPN);
+
+				// Update the kernel with the new targetVPN
+				UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+				if (SetEvent(hEventINIT)) {
+					printf("[*] Sent updated targetVPN to kernel\n");
+				}
+				else {
+					printf("[-] Failed to notify kernel of targetVPN update: %d\n", GetLastError());
+				}
+			}
+			break;
+		case 'i':
+		case 'I':
+			// copy the input to sourceProcess max 15 chars
+			// Buffer to hold the input (extra space for overflow protection)
+			RtlZeroMemory(procNameBufferSource, sizeof(procNameBufferSource));
+			procNameIndex = 0;
+
+			printf("Enter source process name (max 14 chars): ");
+			fflush(stdout);
+
+			// Read characters until Enter is pressed
+			inputChar;
+			while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+				// Handle backspace
+				if (inputChar == '\b') {
+					if (procNameIndex > 0) {
+						procNameIndex--;
+						procNameBufferSource[procNameIndex] = '\0';
+						printf("\b \b"); // Erase character from display
+					}
+				}
+				// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
+				else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
+					procNameBufferSource[procNameIndex++] = (char)inputChar;
+					printf("%c", inputChar); // Echo the character
+				}
+			}
+
+			// Null-terminate the string
+			procNameBufferSource[procNameIndex] = '\0';
+			printf("\n");
+
+			// Only proceed if they entered something
+			if (procNameIndex > 0) {
+					printf("[*] Source process updated to: %s\n", procNameBufferSource);
+
+					// Update kernel with the new sourceProcess
+					sourceProcess = procNameBufferSource;
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+					if (SetEvent(hEventINIT)) {
+						printf("[*] Sent updated sourceProcess to kernel\n");
+					}
+					else {
+						printf("[-] Failed to notify kernel of sourceProcess update: %d\n", GetLastError());
+					}
+			}
+			else {
+				printf("[*] No input provided, sourceProcess not changed\n");
+			}
+			break;
+
+		case 'o':
+		case 'O':
+			// copy the input to targetProcess max 15 chars
+			// Buffer to hold the input (extra space for overflow protection)
+			RtlZeroMemory(procNameBufferTarget, sizeof(procNameBufferTarget));
+			procNameIndex = 0;
+
+			printf("Enter target process name (max 14 chars): ");
+			fflush(stdout);
+
+			// Read characters until Enter is pressed
+			inputChar;
+			while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+				// Handle backspace
+				if (inputChar == '\b') {
+					if (procNameIndex > 0) {
+						procNameIndex--;
+						procNameBufferTarget[procNameIndex] = '\0';
+						printf("\b \b"); // Erase character from display
+					}
+				}
+				// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
+				else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
+					procNameBufferTarget[procNameIndex++] = (char)inputChar;
+					printf("%c", inputChar); // Echo the character
+				}
+			}
+
+			// Null-terminate the string
+			procNameBufferTarget[procNameIndex] = '\0';
+			printf("\n");
+
+			// Only proceed if they entered something
+			if (procNameIndex > 0) {
+					printf("[*] Target process updated to: %s\n", procNameBufferTarget);
+
+					// Update kernel with the new targetProcess
+					targetProcess = procNameBufferTarget;
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+					if (SetEvent(hEventINIT)) {
+						printf("[*] Sent updated targetProcess to kernel\n");
+					}
+					else {
+						printf("[-] Failed to notify kernel of targetProcess update: %d\n", GetLastError());
+					}
+			}
+			else {
+				printf("[*] No input provided, targetProcess not changed\n");
+			}
+			break;
 
 		case '\n':
 		case '\r':  // Handle Enter presses
 			break;
-
 		default:
-			printf("Unknown command '%c'. Try 'c', 'y', or 'x'.\n", ch);
+			printf("Unknown command '%c'. Try:\n", ch);
+			ShowHelp();
 			break;
 		}
 	}
@@ -1110,13 +1283,16 @@ cleanup:
 	//if (hMapFile) {
 	//	CloseHandle(hMapFile);
 	//}
-	//printf("Unlink memory at source VA:\n");
-	//if (SetEvent(hEventUnlink)) {
-	//	printf("[*] Event set successfully\n");
-	//}
-	//else {
-	//	printf("[-] Failed to set event: %d\n", GetLastError());
-	//}
+	printf("Unlink memory at source VA:\n");
+	if (SetEvent(hEventUnlink)) {
+		printf("[*] Event set successfully\n");
+	}
+	else {
+		printf("[-] Failed to set event: %d\n", GetLastError());
+	}
+	while (true) {
+
+	}
 	//printf("[*] Cleanup symbol_ctx (NOT)\n");
 	//UnloadSymbols(sym_ctxNtskrnl, false); // TODO: This has to be properly Unloaded
 
