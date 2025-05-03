@@ -38,6 +38,7 @@ HANDLE hEventUnlink;
 HANDLE hEventUSERMODEREADY;
 HANDLE hEventINIT;
 
+BOOL g_StopRequested = FALSE;
 
 NTSTATUS DriverInitialize(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pusRegistryPath) {
 	PDEVICE_OBJECT pDeviceObject = NULL;
@@ -66,22 +67,22 @@ void DriverUnload(PDRIVER_OBJECT pDriverObject) {
 	//if (gSymbolList != NULL)
 	//	ExFreePool(gSymbolList);
 	
-	ZwClose(hEventLINK);
-	ZwClose(hEventUnlink);
-	ZwClose(hEventINIT);
-	ZwClose(hEventUSERMODEREADY);
-
-	ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-	ZwClose(hInSection);
-
-	DbgPrint("[+] Freeing space...\n");
-	ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSection);
-	ZwClose(gpDeviceContext->hSection);
-
-	DbgPrint("[+] Freeing space for FileName...\n");
-	ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSectionFileName);
-	ZwClose(gpDeviceContext->hSectionFileName);
-
+	//ZwClose(hEventLINK);
+	//ZwClose(hEventUnlink);
+	//ZwClose(hEventINIT);
+	//ZwClose(hEventUSERMODEREADY);
+	//
+	//ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
+	//ZwClose(hInSection);
+	//
+	//DbgPrint("[+] Freeing space...\n");
+	//ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSection);
+	//ZwClose(gpDeviceContext->hSection);
+	//
+	//DbgPrint("[+] Freeing space for FileName...\n");
+	//ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSectionFileName);
+	//ZwClose(gpDeviceContext->hSectionFileName);
+	g_StopRequested = TRUE;
 	DbgPrint("[+] Unloading driver...\n");
 	//ObDereferenceObject(hEventUSERMODEREADY);
 	//ObDereferenceObject(hEventUnlink);
@@ -165,6 +166,7 @@ BOOL InsertVADNode(int Level,
 		return FALSE;
 	}
 	if (gFileNameViewSize / sizeof(VAD_NODE_FILE) <= gCurrFileNameOffset) {
+		DbgPrint("[-] FileName node index out of bounds\n");
 		return FALSE;
 	}
 
@@ -345,6 +347,7 @@ VOID WalkVAD(  PEPROCESS TargetProcess,
 	ULONG totalLevels = 0;
 	ULONG maxDepth = 0;
 	gSecVADIndex = 0;
+	gCurrFileNameOffset = 0;
 
 	// Call recursive function with statistics tracking - passing the targetAdr
 	WalkVADRecursive(*pVADRoot, StartingVpnOffset, EndingVpnOffset, Left, Right, 1,
@@ -781,7 +784,6 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 	return;
 }
 // -----------------------------------------------------------------
-BOOL g_StopRequested = FALSE;
 VOID WorkerThread(PVOID Context) {
 	PKEVENT pEvent = (PKEVENT)Context;
 	while (!g_StopRequested) {
@@ -800,28 +802,41 @@ VOID WorkerThread(PVOID Context) {
 VOID LinkWorkerThread(PVOID Context) {
 	PKEVENT pEvent = (PKEVENT)Context;
 	while (!g_StopRequested) {
+		pEvent->Header.SignalState = 0; // Reset the event
 		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
 		if (!NT_SUCCESS(status)) {
 			DbgPrint("[-] LinkWorkerThread Failed to wait for event: %08X\n", status);
 			break;
 		}
+		// check if gInit.sourceProcess and gInit.targetProcess contains data or is filled with null-bytes
+		if (gInit.sourceProcess[0] == '\0' || gInit.targetProcess[0] == '\0') {
+			DbgPrint("[-] LinkWorkerThread: sourceProcess or targetProcess is invalid (empty)\n");
+			break;
+		}
+
 		gSourceProcess = GetProcessByName(gInit.sourceProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
 		PEPROCESS pTargetProcess = GetProcessByName(gInit.targetProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
 		unsigned long long targetCR3 = GetDirectoryTableBaseByName(gInit.targetProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks, gSymInfo.KPROCDirectoryTableBase);
 		unsigned long long sourceCR3 = GetDirectoryTableBaseByName(gInit.sourceProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks, gSymInfo.KPROCDirectoryTableBase);
 		if (gInit.targetVPN != 0x0) {
 			PVOID targetVA = gInit.targetVPN * 0x1000;
+			DbgPrint("VirtToPhys\n");
 			VirtToPhys(gInit.sourceVA, gSourceProcess, sourceCR3, TRUE);
 			//VirtToPhys(targetVA, pTargetProcess, targetCR3, TRUE);
+			DbgPrint("ChangeRef\n");
 			ChangeRef(gInit.sourceVA, gSourceProcess, sourceCR3, targetVA, pTargetProcess, targetCR3);
 		}
-		pEvent->Header.SignalState = 0; // Reset the event
+		else {
+			DbgPrint("[-] LinkWorkerThread: targetVPN is invalid (0x0)\n");
+			break;
+		}
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 VOID UnlinkWorkerThread(PVOID Context) {
 	PKEVENT pEvent = (PKEVENT)Context;
 	while (!g_StopRequested) {
+		pEvent->Header.SignalState = 0; // Reset the event
 		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
 		if (!NT_SUCCESS(status)) {
 			DbgPrint("[-] UnlinkWorkerThread, Failed to wait for event: %08X\n", status);
@@ -829,7 +844,6 @@ VOID UnlinkWorkerThread(PVOID Context) {
 		}
 		if (gOrigVal != 0x0 && gOrigPhys.QuadPart != 0x0 && gSourceProcess != NULL) {
 			PKAPC_STATE ApcState;
-			DbgPrint("gSourceProcess: 0x%llx\n", gSourceProcess);
 			KeStackAttachProcess(gSourceProcess, &ApcState);
 			PVOID* temp = MmGetVirtualForPhysical(gOrigPhys);
 			memcpy(temp, &gOrigVal, sizeof(gOrigVal));
@@ -850,18 +864,42 @@ VOID UnlinkWorkerThread(PVOID Context) {
 		else {
 			DbgPrint("[-] No modified PTEs to restore\n");
 		}
-		pEvent->Header.SignalState = 0; // Reset the event
+
+		ZwClose(hEventLINK);
+		ZwClose(hEventUnlink);
+		ZwClose(hEventINIT);
+		ZwClose(hEventUSERMODEREADY);
+
+		ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
+		ZwClose(hInSection);
+
+		DbgPrint("[+] Freeing space...\n");
+		ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSection);
+		ZwClose(gpDeviceContext->hSection);
+
+		DbgPrint("[+] Freeing space for FileName...\n");
+		ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSectionFileName);
+		ZwClose(gpDeviceContext->hSectionFileName);
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 VOID UserModeReadWorkerThread(PVOID Context) {
+	g_StopRequested = FALSE;
 	PKEVENT pEvent = (PKEVENT)Context;
 	while (!g_StopRequested) {
+		pEvent->Header.SignalState = 0; // Reset the event
 		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL); // TODO: perhaps change to WaitForMultipleObjects
 		if (!NT_SUCCESS(status)) {
 			DbgPrint("[-] UserModeReadWorkerThread Failed to wait for event: %08X\n", status);
 			break;
 		}
+
+		// check if gInit.sourceProcess and gInit.targetProcess contains data or is filled with null-bytes
+		if (gInit.targetProcess[0] == '\0') {
+			DbgPrint("[-] UserModeReadWorkerThread: targetProcess is invalid (empty)\n");
+			break;
+		}
+
 		// Make sure section is not getting paged-out | VAD Node Info - Memory Section
 		DbgPrint("[+] Allocating MDL for section\n");
 		gpDeviceContext->pMdl = IoAllocateMdl(gSection, gViewSize, FALSE, FALSE, NULL);
@@ -879,6 +917,7 @@ VOID UserModeReadWorkerThread(PVOID Context) {
 		PEPROCESS pTargetProcess = GetProcessByName(gInit.targetProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
 
 		RtlZeroMemory(gFileNameSection, gFileNameViewSize);
+		RtlZeroMemory(gSection, gViewSize);
 		if (pTargetProcess != NULL) {
 			WalkVAD(pTargetProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
 				gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
@@ -890,7 +929,6 @@ VOID UserModeReadWorkerThread(PVOID Context) {
 
 		MmUnlockPages(gpDeviceContext->pFileNameMdl);
 		IoFreeMdl(gpDeviceContext->pFileNameMdl);
-		pEvent->Header.SignalState = 0; // Reset the event
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -898,6 +936,7 @@ VOID INITWorkerThread(PVOID Context) {
 	PKEVENT pEvent = (PKEVENT)Context;
 	int test;
 	while (!g_StopRequested) {
+		pEvent->Header.SignalState = 0; // Reset the event
 		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL); // TODO: perhaps change to WaitForMultipleObjects
 		if (!NT_SUCCESS(status)) {
 			DbgPrint("[-] UserModeReadWorkerThread Failed to wait for event: %08X\n", status);
@@ -933,7 +972,8 @@ VOID INITWorkerThread(PVOID Context) {
 			return STATUS_UNSUCCESSFUL;
 		}
 		DbgPrint("[+] Finished initializing data and symbol information\n");
-		pEvent->Header.SignalState = 0; // Reset the event
+		DbgPrint("[+] Source Process: %s\n", gInit.sourceProcess);
+		DbgPrint("[+] Target Process: %s\n", gInit.targetProcess);
 
 
 		//// Make sure section is not getting paged-out
