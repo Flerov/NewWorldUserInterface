@@ -41,10 +41,22 @@ typedef struct _VAD_NODE {
 	PVOID VADNode;
 	unsigned long long StartingVpn;
 	unsigned long long EndingVpn;
+	unsigned long Protection;
 	//CHAR FileName[MAX_FILENAME_SIZE];
 	UCHAR FileOffset;
 	LIST_ENTRY ListEntry;
-} VAD_NODE, *PVAD_NODE;
+} VAD_NODE, * PVAD_NODE;
+// -----------------------------------------------------------------
+// The Windows Header Flags for Protections are wrong WTF. So we reverse and redefine them.
+typedef enum _PROTECTION
+{
+	_PAGE_READONLY = 0x01, // Read-only access to the page
+	_PAGE_READWRITE = 0x04, // Read and write access to the page
+	_PAGE_WRITECOPY = 0x07, // Copy-on-write access to the page
+	_PAGE_EXECUTE = 0x10, // Execute access to the page
+	_PAGE_NOACCESS = 0x18, // No access to the page
+	_PAGE_EXECUTE_READ = 0x20  // Execute and read access to the page
+} PROTECTION;
 // -----------------------------------------------------------------
 typedef struct _VAD_NODE_FILE {
 	CHAR FileName[MAX_FILENAME_SIZE];
@@ -608,12 +620,12 @@ DWORD64 GetKernelBase(_In_ std::string name) {
 			lpImageBase[i],
 			lpFileName,
 			sizeof(lpFileName) / sizeof(char)
-				);
-				// Compares the indexed driver and with our specified driver name
-				if (!strcmp(name.c_str(), lpFileName)) {
-					imageBase = (DWORD64)lpImageBase[i];
-					break;
-				}
+		);
+		// Compares the indexed driver and with our specified driver name
+		if (!strcmp(name.c_str(), lpFileName)) {
+			imageBase = (DWORD64)lpImageBase[i];
+			break;
+		}
 	}
 	return imageBase;
 }
@@ -693,9 +705,21 @@ void CheckModifiedMemory(PVOID address, size_t size) {
 	}
 }
 // -----------------------------------------------------------------
+const char* ProtectionToStr(PROTECTION prot) {
+	switch (prot) {
+	case _PAGE_NOACCESS:     return "PAGE_NOACCESS";
+	case _PAGE_READONLY:     return "PAGE_READONLY";
+	case _PAGE_READWRITE:    return "PAGE_READWRITE";
+	case _PAGE_WRITECOPY:    return "PAGE_WRITECOPY";
+	case _PAGE_EXECUTE:      return "PAGE_EXECUTE";
+	case _PAGE_EXECUTE_READ: return "PAGE_EXECUTE_READ";
+	default:                   return "UNKNOWN_PROTECTION";
+	}
+}
+// -----------------------------------------------------------------
 void GetSymOffsets(PVOID SecBase, size_t SecSize,
-					 PVOID FileNameSecBase,
-					 SIZE_T FileNameSecSize) {
+	PVOID FileNameSecBase,
+	SIZE_T FileNameSecSize) {
 	if (SecBase == NULL)
 		return;
 
@@ -705,48 +729,96 @@ void GetSymOffsets(PVOID SecBase, size_t SecSize,
 	// Calculate maximum symbols based on remaining size
 	size_t maxSymCount = SecSize / sizeof(VAD_NODE);
 	size_t maxFileNames = FileNameSecSize / sizeof(VAD_NODE_FILE);
+	PROTECTION prot;
 
 	// Print header with consistent column widths
-	printf("\nLevel      VADNode                     StartingVpn        EndingVpn          FileName\n");
-	printf("-----      -------                     -----------        ---------          --------\n");
+	printf("\n%-6s %-26s %-12s %-12s %-6s %-35s %-30s\n",
+		"Level", "VADNode", "StartingVpn", "EndingVpn", "4KBs", "FileName", "Protection");
+	printf("%-6s %-26s %-12s %-12s %-6s %-35s %-30s\n",
+		"-----", "-------", "-----------", "---------", "---------", "---------", "----------");
+
 	__try {
 		for (size_t i = 0; i < maxSymCount - 1; i++) {
-			if (node[i].Level == 0 || node[i].Level == 0) {
+			if (node[i].Level == 0)
 				continue; // Skip if Level is 0
+
+			prot = (PROTECTION)node[i].Protection;
+			const char* protStr = ProtectionToStr(prot);
+			DWORD64 rangeSize = node[i].EndingVpn - node[i].StartingVpn;
+
+			if (node[i].FileOffset == 0 || node[i].FileOffset >= maxFileNames) {
+				printf("%-6d 0x%-24p 0x%010I64x 0x%010I64x %-6d %-35s %-15s [0x%lx]\n",
+					node[i].Level,
+					node[i].VADNode,
+					node[i].StartingVpn,
+					node[i].EndingVpn,
+					node[i].EndingVpn - node[i].StartingVpn,
+					"-",  // No filename
+					protStr,
+					node[i].Protection);
 			}
-			if (node[i].FileOffset == 0) {
-				printf("%-10d 0x%p          0x%010I64x     0x%010I64x | %d",
+			else {
+				printf("%-6d 0x%-24p 0x%010I64x 0x%010I64x %-6d %-35s %-15s [0x%lx]\n",
 					node[i].Level,
 					node[i].VADNode,
 					node[i].StartingVpn,
 					node[i].EndingVpn,
-					node[i].EndingVpn - node[i].StartingVpn);
-			} else {
-				if (node[i].FileOffset >= maxFileNames) {
-					printf("FileOffset out of bounds: %d\n", node[i].FileOffset);
-					continue; // Skip if FileOffset is out of bounds
-				}
-				printf("%-10d 0x%p          0x%010I64x     0x%010I64x     %s | %d",
-					node[i].Level,
-					node[i].VADNode,
-					node[i].StartingVpn,
-					node[i].EndingVpn,
+					node[i].EndingVpn - node[i].StartingVpn,
 					FileNameBase[node[i].FileOffset].FileName,
-					node[i].EndingVpn - node[i].StartingVpn);
+					protStr,
+					node[i].Protection);
 			}
-			printf("\n");
 		}
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
 		printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
 	}
+	//// Print header with consistent column widths
+	//printf("\nLevel      VADNode                     StartingVpn        EndingVpn          FileName          Protection\n");
+	//printf("-----      -------                     -----------        ---------          --------          --------\n");
+	//__try {
+	//	for (size_t i = 0; i < maxSymCount - 1; i++) {
+	//		if (node[i].Level == 0 || node[i].Level == 0) {
+	//			continue; // Skip if Level is 0
+	//		}
+	//		prot = (PROTECTION)node[i].Protection;
+	//		if (node[i].FileOffset == 0) {
+	//			printf("%-10d 0x%p          0x%010I64x     0x%010I64x | %d - %s [0x%lx]",
+	//				node[i].Level,
+	//				node[i].VADNode,
+	//				node[i].StartingVpn,
+	//				node[i].EndingVpn,
+	//				node[i].EndingVpn - node[i].StartingVpn,
+	//				ProtectionToStr(prot),
+	//				node[i].Protection);
+	//		} else {
+	//			if (node[i].FileOffset >= maxFileNames) {
+	//				printf("FileOffset out of bounds: %d\n", node[i].FileOffset);
+	//				continue; // Skip if FileOffset is out of bounds
+	//			}
+	//			printf("%-10d 0x%p          0x%010I64x     0x%010I64x     %s | %d - %s [0x%lx]",
+	//				node[i].Level,
+	//				node[i].VADNode,
+	//				node[i].StartingVpn,
+	//				node[i].EndingVpn,
+	//				FileNameBase[node[i].FileOffset].FileName,
+	//				node[i].EndingVpn - node[i].StartingVpn,
+	//				ProtectionToStr(prot),
+	//				node[i].Protection);
+	//		}
+	//		printf("\n");
+	//	}
+	//} __except (EXCEPTION_EXECUTE_HANDLER) {
+	//	printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
+	//}
 
 	return;
 }
 // -----------------------------------------------------------------
 void UpdateInitData(const char* sourceProcess,
-					const char* targetProcess,
-					unsigned long long sourceVA,
-					unsigned long long targetVPN) {
+	const char* targetProcess,
+	unsigned long long sourceVA,
+	unsigned long long targetVPN) {
 	PINIT Data = (PINIT)SymbolsArray;
 	if (sourceProcess != NULL) {
 		size_t copyLenSource = min(strlen(sourceProcess), sizeof(Data[0].sourceProcess) - 1);
@@ -776,8 +848,6 @@ void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
 
 	if (AddInitData(ntBase, kprocDirectoryTableBase, eprocActiveProcessLinks, eprocUniqueProcessId, 0x0, 0x0))
 		printf("[*] InitData added successfully\n");
-	//GetAndInsertSymbol("sourceVA", sym_ctxNtskrnl, (unsigned long long)sourceVA, true);
-	//GetAndInsertSymbol("targetVPN", sym_ctxNtskrnl, targetVPN, true);
 
 	GetAndInsertSymbol("eprocUniqueProcessId", sym_ctxNtskrnl, eprocUniqueProcessId, true); // TODO: exceution stops here???
 	GetAndInsertSymbol("eprocActiveProcessLinks", sym_ctxNtskrnl, eprocActiveProcessLinks, true);
@@ -816,6 +886,156 @@ void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
 	GetAndInsertSymbol("LdrBaseDllBase", sym_ctxNtskrnl, LdrBaseDllBase, true);
 }
 
+// -----------------------------------------------------------------
+// Converts a hex string (like "41 42 ?? 44") to byte array and mask
+// Returns true if conversion successful, false otherwise
+bool ParseHexPattern(const char* hexPattern, std::vector<unsigned char>& pattern, std::vector<bool>& mask) {
+	pattern.clear();
+	mask.clear();
+
+	if (!hexPattern || *hexPattern == '\0')
+		return false;
+
+	const char* ptr = hexPattern;
+	while (*ptr) {
+		// Skip whitespace
+		if (isspace(*ptr)) {
+			ptr++;
+			continue;
+		}
+
+		// Handle wildcards
+		if (*ptr == '?') {
+			pattern.push_back(0);
+			mask.push_back(false);  // false = ignore this byte when matching
+			ptr++;
+			// Skip second question mark if present (for "??" notation)
+			if (*ptr == '?')
+				ptr++;
+		}
+		// Process hex byte
+		else if (isxdigit(ptr[0]) && isxdigit(ptr[1])) {
+			char byteStr[3] = { ptr[0], ptr[1], 0 };
+			unsigned char byte = (unsigned char)strtoul(byteStr, nullptr, 16);
+			pattern.push_back(byte);
+			mask.push_back(true);  // true = check this byte when matching
+			ptr += 2;
+		}
+		else {
+			// Invalid character
+			return false;
+		}
+	}
+
+	return !pattern.empty();
+}
+
+// -----------------------------------------------------------------
+// Searches for pattern in a range of memory
+// Returns vector of offsets where pattern was found
+std::vector<size_t> ScanMemory(const void* memoryStart, size_t memorySize, const char* hexPattern) {
+	std::vector<size_t> results;
+
+	if (!memoryStart || !hexPattern || memorySize == 0)
+		return results;
+
+	// Convert hex pattern to bytes and mask
+	std::vector<unsigned char> pattern;
+	std::vector<bool> mask;
+
+	if (!ParseHexPattern(hexPattern, pattern, mask))
+		return results;
+
+	if (pattern.size() > memorySize)
+		return results;  // Pattern is larger than scan range
+
+	const unsigned char* memory = static_cast<const unsigned char*>(memoryStart);
+
+	// Scan through memory
+	for (size_t i = 0; i <= memorySize - pattern.size(); i++) {
+		bool found = true;
+
+		for (size_t j = 0; j < pattern.size(); j++) {
+			// If mask[j] is true, check byte; otherwise, it's a wildcard
+			if (mask[j] && memory[i + j] != pattern[j]) {
+				found = false;
+				break;
+			}
+		}
+
+		if (found) {
+			results.push_back(i);
+		}
+	}
+
+	return results;
+}
+
+#define min(a,b)            (((a) < (b)) ? (a) : (b))
+// -----------------------------------------------------------------
+// Helper function that scans memory and prints results
+bool ScanAndPrintMemory(const void* address, const char* hexPattern) {
+	//printf("[*] Scanning 4096 bytes at address 0x%p for pattern: %s\n", address, hexPattern);
+
+	// Use Structured Exception Handling to prevent crashes on invalid memory
+	//__try {
+		// First, convert the pattern to get its size
+		std::vector<unsigned char> pattern;
+		std::vector<bool> mask;
+		if (!ParseHexPattern(hexPattern, pattern, mask)) {
+			printf("[-] Invalid hex pattern format\n");
+			return 0;
+		}
+
+		// Now perform the scan
+		std::vector<size_t> matches = ScanMemory(address, 4096, hexPattern);
+
+		if (matches.empty()) {
+			printf("[-] No matches found\n");
+			return 0;
+		}
+
+		if (matches.size() >= 1) {
+			printf("[+] Found %zu matches:\n", matches.size());
+			// Print each match with surrounding context
+			const unsigned char* memory = static_cast<const unsigned char*>(address);
+			for (size_t offset : matches) {
+				printf("[+] Match at offset 0x%04zx (address 0x%p):\n", offset, static_cast<const unsigned char*>(address) + offset);
+
+				// Display hex dump of found pattern with context
+				printf("    ");
+
+				// Determine context range (8 bytes before, 8 bytes after)
+				size_t contextStart = offset > 8 ? offset - 8 : 0;
+				size_t contextEnd = min(offset + pattern.size() + 8, 4096ULL);
+
+				// Print hex bytes
+				for (size_t i = contextStart; i < contextEnd; i++) {
+					if (i == offset) printf("[ ");
+					printf("%02X ", memory[i]);
+					if (i == offset + pattern.size() - 1) printf("] ");
+				}
+
+				printf("\n    ");
+
+				// Print ASCII representation
+				for (size_t i = contextStart; i < contextEnd; i++) {
+					if (i == offset) printf("|");
+					char c = memory[i];
+					printf("%c", (c >= 32 && c <= 126) ? c : '.');
+					if (i == offset + pattern.size() - 1) printf("|");
+				}
+
+				printf("\n");
+			}
+			return 1;
+		}
+	//}
+	//__except (EXCEPTION_EXECUTE_HANDLER) {
+	//	printf("[-] Exception occurred while accessing memory: 0x%lx\n", GetExceptionCode());
+	//}
+}
+
 void ShowHelp() {
 	printf("---------------------------------------------------------------\n");
 	printf("[*] Press '1' to populate VAD-Tree\n");
@@ -827,6 +1047,10 @@ void ShowHelp() {
 	printf("[*] Press 'U' to update target VPN\n");
 	printf("[*] Press 'I' to update source process\n");
 	printf("[*] Press 'O' to update target process\n");
+	printf("[*] Press 'E' to write memory\n");
+	printf("[*] Press 'M' to set memory view size\n");
+	printf("[*] Press 'X' to unlink\n");
+	printf("[*] Press 'P' to scan memory for a pattern\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -841,7 +1065,6 @@ int main(int argc, char* argv[]) {
 	SymbolsArrayAllocationSize = sizeof(INIT);
 	SymbolsArrayAllocationSize += NumSymbols * sizeof(SYMBOL); // TODO: Change to new Var: TotalAllocationSize
 
-	//HANDLE hMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SymbolsArrayAllocationSize, MAPPING_NAME_TO);
 	HANDLE hMapFile = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_TO);
 	if (!hMapFile) {
 		printf("[-] Failed to create file mapping: %d", GetLastError());
@@ -957,7 +1180,7 @@ int main(int argc, char* argv[]) {
 	}
 	printf("[*] MAPPING_NAME_FROM VAD file mapping created successfully\n");
 
-	PVOID VADArray = (VOID*)MapViewOfFile(hVADMapFile, FILE_MAP_WRITE, 0, 0, 4096 * 3);
+	PVOID VADArray = (VOID*)MapViewOfFile(hVADMapFile, FILE_MAP_WRITE, 0, 0, 0);
 	if (!VADArray) {
 		printf("[-] Failed to map VAD file mapping: %d\n", GetLastError());
 		CloseHandle(hVADMapFile);
@@ -972,7 +1195,7 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 	printf("[*] MAPPING_NAME_FROM_FILENAMES VAD file mapping created successfully\n");
-	PVOID VADArrayFileName = (VOID*)MapViewOfFile(hVADMapFileName, FILE_MAP_WRITE, 0, 0, 4096 * 2); // should be 2 * 4096??? TODO:
+	PVOID VADArrayFileName = (VOID*)MapViewOfFile(hVADMapFileName, FILE_MAP_WRITE, 0, 0, 0); // should be 2 * 4096??? TODO:
 	if (!VADArrayFileName) {
 		printf("[-] Failed to map VAD file mapping: %d\n", GetLastError());
 		CloseHandle(hVADMapFileName);
@@ -1034,157 +1257,189 @@ int main(int argc, char* argv[]) {
 	char procNameBufferTarget[32] = { 0 };
 	int procNameIndex = 0;
 	int inputChar;
+
+	unsigned int offset = 0;
+	unsigned char value = 0;
+	char inputBuffer[64] = { 0 };
+	int inputIndex = 0;
+	bool validInput = false;
+	bool inNumber = false;
+	char tempHexByte[3] = { 0 }; // To store each 2-digit hex value
+	int tempIndex = 0;
+	std::vector<unsigned char> bytesToWrite;
+	unsigned char byteVal;
+	unsigned char* memPtr;
+
+	char sizeBuffer[32] = { 0 };
+	int sizeIndex = 0;
+
+	char pattern[256] = { 0 };
+	int patternIndex;
+	int patternChar;
+	PVOID SecBase;
+	size_t SecSize;
+	PVOID FileNameSecBase;
+	size_t FileNameSecSize;
+	PVAD_NODE node;
+	PVAD_NODE_FILE FileNameBase;
+	size_t maxSymCount;
+	PROTECTION prot;
+	const char* protStr;
+	DWORD64 rangeSize;
+	unsigned long long currentVPN;
+	size_t pages;
+	bool continueScan = true;
 	// More robust command loop implementation
 	bool running = true;
-	while (running) {
-		printf("\nEnter command: ");
-		fflush(stdout);  // Ensure the prompt is displayed
+		while (running) {
+			printf("\nEnter command: ");
+			fflush(stdout);  // Ensure the prompt is displayed
 
-		// Read a single character
-		int ch = _getch();  // Use _getch() for single character input without buffering
-		printf("%c\n", ch); // Echo the character for user feedback
+			// Read a single character
+			int ch = _getch();  // Use _getch() for single character input without buffering
+			printf("%c\n", ch); // Echo the character for user feedback
 
-		// Process the command
-		switch (ch) {
-		case '1':
-			RtlZeroMemory(VADArray, 4096 * 3);
-			RtlZeroMemory(VADArrayFileName, 4096 * 2);
-			if (targetProcess != NULL) {
-				if (SetEvent(hEventUSERMODEREADY)) { // TODO: Should all be CLI controlled? Like this we will always buffer the VAD-Tree
-					printf("[*] Notified driver to populate VAD-Tree\n");
+			// Process the command
+			switch (ch) {
+			case '1':
+				RtlZeroMemory(VADArray, 4096 * 4);
+				RtlZeroMemory(VADArrayFileName, 4096 * 4);
+				if (targetProcess != NULL) {
+					if (SetEvent(hEventUSERMODEREADY)) { // TODO: Should all be CLI controlled? Like this we will always buffer the VAD-Tree
+						printf("[*] Notified driver to populate VAD-Tree\n");
+					}
+					else {
+						printf("[-] Failed to notified driver to populate VAD-Tree: %d\n", GetLastError());
+					}
 				}
-				else {
-					printf("[-] Failed to notified driver to populate VAD-Tree: %d\n", GetLastError());
+				break;
+			case '2':
+				printf("[*] VAD offsets:\n");
+				GetSymOffsets(VADArray, 4096 * 4, VADArrayFileName, 4096 * 4);
+				break;
+			case '3':
+				printf("[*] Memory at source VA:\n");
+				if (targetVPNSize == 0) {
+					targetVPNSize = 4096; // Default size if not set
 				}
-			}
-			break;
-		case '2':
-			printf("[*] VAD offsets:\n");
-			GetSymOffsets(VADArray, 4096, VADArrayFileName, 4096 * 2);
-			break;
-		case '3':
-			printf("[*] Memory at source VA:\n");
-			if (targetVPNSize == 0) {
-				targetVPNSize = 4096; // Default size if not set
-			}
-			CheckModifiedMemory(sourceVA, targetVPNSize);
-			break;
-		case '4':
-			//if (targetVPN != NULL && sourceProcess != NULL) {
+				CheckModifiedMemory(sourceVA, targetVPNSize);
+				break;
+			case '4':
+				//if (targetVPN != NULL && sourceProcess != NULL) {
 				if (SetEvent(hEventLINK)) { // TODO: Should all be CLI controlled? Like this we will Link
 					printf("[*] Notified driver to link to VAD-Tree Node\n");
 				}
 				else {
 					printf("[-] Failed to notified driver to link to VAD-Tree Node: %d\n", GetLastError());
 				}
-			//}
-			break;
-		case '5':
-			printf("[*] Exiting program with cleanup...\n");
-			running = false;
-			break;
-		case '6':
-			// silen exit
-			printf("[*] Exiting program silently...\n");
-			return 0;
-		case 'u':
-		case 'U':
-			// SCAN FOR TARGET VPN UPDATE
+				//}
+				break;
+			case '5':
+				printf("[*] Exiting program with cleanup...\n");
+				running = false;
+				break;
+			case '6':
+				// silen exit
+				printf("[*] Exiting program silently...\n");
+				return 0;
+			case 'u':
+			case 'U':
+				// SCAN FOR TARGET VPN UPDATE
 
-			// Read additional characters for a multi-character hex number
-			index = 0;
-			printf("Continue entering hex value (press Enter when done): ");
+				// Read additional characters for a multi-character hex number
+				index = 0;
+				printf("Continue entering hex value (press Enter when done): ");
 
-			// Continue reading until Enter is pressed
-			nextChar;
-			while ((nextChar = _getch()) != '\r' && nextChar != '\n') {
-				// Only accept valid hex characters (0-9, a-f, A-F) and control characters
-				if ((nextChar >= '0' && nextChar <= '9') ||
-					(nextChar >= 'a' && nextChar <= 'f') ||
-					(nextChar >= 'A' && nextChar <= 'F') ||
-					nextChar == 'x' || nextChar == 'X' ||
-					nextChar == '\b') {
+				// Continue reading until Enter is pressed
+				nextChar;
+				while ((nextChar = _getch()) != '\r' && nextChar != '\n') {
+					// Only accept valid hex characters (0-9, a-f, A-F) and control characters
+					if ((nextChar >= '0' && nextChar <= '9') ||
+						(nextChar >= 'a' && nextChar <= 'f') ||
+						(nextChar >= 'A' && nextChar <= 'F') ||
+						nextChar == 'x' || nextChar == 'X' ||
+						nextChar == '\b') {
 
-					if (nextChar == '\b') {
-						// Handle backspace - remove last character
-						if (index > 0) {
-							buffer[--index] = '\0';
-							printf("\b \b"); // Erase last character from display
+						if (nextChar == '\b') {
+							// Handle backspace - remove last character
+							if (index > 0) {
+								buffer[--index] = '\0';
+								printf("\b \b"); // Erase last character from display
+							}
+						}
+						else if (index < sizeof(buffer) - 1) {
+							// Add character to buffer and echo it
+							buffer[index++] = (char)nextChar;
+							printf("%c", nextChar);
 						}
 					}
-					else if (index < sizeof(buffer) - 1) {
-						// Add character to buffer and echo it
-						buffer[index++] = (char)nextChar;
-						printf("%c", nextChar);
-					}
 				}
-			}
 
-			printf("\n");
-			buffer[index] = '\0';
+				printf("\n");
+				buffer[index] = '\0';
 
-			// Try to convert the buffer to a number
-			endPtr = NULL;
-			newTargetVPN = 0;
+				// Try to convert the buffer to a number
+				endPtr = NULL;
+				newTargetVPN = 0;
 
-			// Handle both "0x" prefix and no prefix
-			if (strncmp(buffer, "0x", 2) == 0 || strncmp(buffer, "0X", 2) == 0) {
-				newTargetVPN = strtoull(buffer + 2, &endPtr, 16);
-			}
-			else {
-				newTargetVPN = strtoull(buffer, &endPtr, 16);
-			}
-
-			// Validate the conversion
-			if (endPtr != buffer && *endPtr == '\0') {
-				// Conversion succeeded
-				targetVPN = newTargetVPN;
-				printf("[*] Target VPN updated to: 0x%llx\n", targetVPN);
-
-				// Update the kernel with the new targetVPN
-				UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
-				if (SetEvent(hEventINIT)) {
-					printf("[*] Sent updated targetVPN to kernel\n");
+				// Handle both "0x" prefix and no prefix
+				if (strncmp(buffer, "0x", 2) == 0 || strncmp(buffer, "0X", 2) == 0) {
+					newTargetVPN = strtoull(buffer + 2, &endPtr, 16);
 				}
 				else {
-					printf("[-] Failed to notify kernel of targetVPN update: %d\n", GetLastError());
+					newTargetVPN = strtoull(buffer, &endPtr, 16);
 				}
-			}
-			break;
-		case 'i':
-		case 'I':
-			// copy the input to sourceProcess max 15 chars
-			// Buffer to hold the input (extra space for overflow protection)
-			RtlZeroMemory(procNameBufferSource, sizeof(procNameBufferSource));
-			procNameIndex = 0;
 
-			printf("Enter source process name (max 14 chars): ");
-			fflush(stdout);
+				// Validate the conversion
+				if (endPtr != buffer && *endPtr == '\0') {
+					// Conversion succeeded
+					targetVPN = newTargetVPN;
+					printf("[*] Target VPN updated to: 0x%llx\n", targetVPN);
 
-			// Read characters until Enter is pressed
-			inputChar;
-			while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
-				// Handle backspace
-				if (inputChar == '\b') {
-					if (procNameIndex > 0) {
-						procNameIndex--;
-						procNameBufferSource[procNameIndex] = '\0';
-						printf("\b \b"); // Erase character from display
+					// Update the kernel with the new targetVPN
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+					if (SetEvent(hEventINIT)) {
+						printf("[*] Sent updated targetVPN to kernel\n");
+					}
+					else {
+						printf("[-] Failed to notify kernel of targetVPN update: %d\n", GetLastError());
 					}
 				}
-				// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
-				else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
-					procNameBufferSource[procNameIndex++] = (char)inputChar;
-					printf("%c", inputChar); // Echo the character
+				break;
+			case 'i':
+			case 'I':
+				// copy the input to sourceProcess max 15 chars
+				// Buffer to hold the input (extra space for overflow protection)
+				RtlZeroMemory(procNameBufferSource, sizeof(procNameBufferSource));
+				procNameIndex = 0;
+
+				printf("Enter source process name (max 14 chars): ");
+				fflush(stdout);
+
+				// Read characters until Enter is pressed
+				inputChar;
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (procNameIndex > 0) {
+							procNameIndex--;
+							procNameBufferSource[procNameIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
+					else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
+						procNameBufferSource[procNameIndex++] = (char)inputChar;
+						printf("%c", inputChar); // Echo the character
+					}
 				}
-			}
 
-			// Null-terminate the string
-			procNameBufferSource[procNameIndex] = '\0';
-			printf("\n");
+				// Null-terminate the string
+				procNameBufferSource[procNameIndex] = '\0';
+				printf("\n");
 
-			// Only proceed if they entered something
-			if (procNameIndex > 0) {
+				// Only proceed if they entered something
+				if (procNameIndex > 0) {
 					printf("[*] Source process updated to: %s\n", procNameBufferSource);
 
 					// Update kernel with the new sourceProcess
@@ -1196,46 +1451,46 @@ int main(int argc, char* argv[]) {
 					else {
 						printf("[-] Failed to notify kernel of sourceProcess update: %d\n", GetLastError());
 					}
-			}
-			else {
-				printf("[*] No input provided, sourceProcess not changed\n");
-			}
-			break;
+				}
+				else {
+					printf("[*] No input provided, sourceProcess not changed\n");
+				}
+				break;
 
-		case 'o':
-		case 'O':
-			// copy the input to targetProcess max 15 chars
-			// Buffer to hold the input (extra space for overflow protection)
-			RtlZeroMemory(procNameBufferTarget, sizeof(procNameBufferTarget));
-			procNameIndex = 0;
+			case 'o':
+			case 'O':
+				// copy the input to targetProcess max 15 chars
+				// Buffer to hold the input (extra space for overflow protection)
+				RtlZeroMemory(procNameBufferTarget, sizeof(procNameBufferTarget));
+				procNameIndex = 0;
 
-			printf("Enter target process name (max 14 chars): ");
-			fflush(stdout);
+				printf("Enter target process name (max 14 chars): ");
+				fflush(stdout);
 
-			// Read characters until Enter is pressed
-			inputChar;
-			while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
-				// Handle backspace
-				if (inputChar == '\b') {
-					if (procNameIndex > 0) {
-						procNameIndex--;
-						procNameBufferTarget[procNameIndex] = '\0';
-						printf("\b \b"); // Erase character from display
+				// Read characters until Enter is pressed
+				inputChar;
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (procNameIndex > 0) {
+							procNameIndex--;
+							procNameBufferTarget[procNameIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
+					else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
+						procNameBufferTarget[procNameIndex++] = (char)inputChar;
+						printf("%c", inputChar); // Echo the character
 					}
 				}
-				// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
-				else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
-					procNameBufferTarget[procNameIndex++] = (char)inputChar;
-					printf("%c", inputChar); // Echo the character
-				}
-			}
 
-			// Null-terminate the string
-			procNameBufferTarget[procNameIndex] = '\0';
-			printf("\n");
+				// Null-terminate the string
+				procNameBufferTarget[procNameIndex] = '\0';
+				printf("\n");
 
-			// Only proceed if they entered something
-			if (procNameIndex > 0) {
+				// Only proceed if they entered something
+				if (procNameIndex > 0) {
 					printf("[*] Target process updated to: %s\n", procNameBufferTarget);
 
 					// Update kernel with the new targetProcess
@@ -1247,42 +1502,362 @@ int main(int argc, char* argv[]) {
 					else {
 						printf("[-] Failed to notify kernel of targetProcess update: %d\n", GetLastError());
 					}
-			}
-			else {
-				printf("[*] No input provided, targetProcess not changed\n");
-			}
-			break;
+				}
+				else {
+					printf("[*] No input provided, targetProcess not changed\n");
+				}
+				break;
+			case 'x':
+			case 'X':
+				printf("Unlink memory at source VA:\n");
+				if (SetEvent(hEventUnlink)) {
+					printf("[*] Event set successfully\n");
+				}
+				else {
+					printf("[-] Failed to set event: %d\n", GetLastError());
+				}
+				break;
+			case 'e':
+			case 'E':
+				// Edit the memory at sourceVA. First the user specifies the offset, then the value
+				// Edit the memory at sourceVA with variable number of bytes
+				// Get offset
+				printf("Enter memory offset (hex, max 0xFFF): 0x");
+				fflush(stdout);
 
-		case '\n':
-		case '\r':  // Handle Enter presses
-			break;
-		default:
-			printf("Unknown command '%c'. Try:\n", ch);
-			ShowHelp();
-			break;
+				memset(inputBuffer, 0, sizeof(inputBuffer));
+				inputIndex = 0;
+				validInput = false;
+
+				// Read offset input
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (inputIndex > 0) {
+							inputIndex--;
+							inputBuffer[inputIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Only accept hex characters (0-9, a-f, A-F)
+					else if (((inputChar >= '0' && inputChar <= '9') ||
+						(inputChar >= 'a' && inputChar <= 'f') ||
+						(inputChar >= 'A' && inputChar <= 'F')) &&
+						inputIndex < sizeof(inputBuffer) - 1) {
+
+						inputBuffer[inputIndex++] = (char)inputChar;
+						printf("%c", inputChar); // Echo the character
+					}
+				}
+
+				inputBuffer[inputIndex] = '\0';
+				printf("\n");
+
+				// Convert offset from hex string to integer
+				if (inputIndex > 0) {
+					offset = (unsigned int)strtoul(inputBuffer, NULL, 16);
+
+					// Ensure offset is within the allocated memory (4096 bytes)
+					if (offset < 4096) {
+						validInput = true;
+					}
+					else {
+						printf("[-] Offset 0x%X is outside the allocated memory range (0x000 - 0xFFF)\n", offset);
+					}
+				}
+
+				// If we have a valid offset, get the byte values to write
+				if (validInput) {
+					// Clear prev values in bytesToWrite
+					bytesToWrite.clear();
+
+					printf("Enter byte values to write starting at offset 0x%X (hex, space-separated, e.g. 'FF 01 C3'): ", offset);
+					fflush(stdout);
+
+					// Clear buffer for new input
+					memset(inputBuffer, 0, sizeof(inputBuffer));
+					inputIndex = 0;
+					inNumber = false;
+					tempIndex = 0;
+					memset(tempHexByte, 0, sizeof(tempHexByte));
+					byteVal = NULL;
+					memPtr = NULL;
+
+					// Read the space-separated byte values
+					while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+						// Handle backspace
+						if (inputChar == '\b') {
+							if (inputIndex > 0) {
+								inputIndex--;
+								inputBuffer[inputIndex] = '\0';
+								printf("\b \b"); // Erase character from display
+
+								// Update the temp hex byte and state
+								if (inNumber) {
+									if (tempIndex > 0) {
+										tempIndex--;
+										tempHexByte[tempIndex] = '\0';
+									}
+									if (tempIndex == 0) {
+										inNumber = false;
+									}
+								}
+							}
+						}
+						// Accept space to separate values
+						else if (inputChar == ' ') {
+							if (inNumber && tempIndex > 0) {
+								// Convert and add the current byte
+								byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
+								bytesToWrite.push_back(byteVal);
+
+								// Reset for next byte
+								memset(tempHexByte, 0, sizeof(tempHexByte));
+								tempIndex = 0;
+								inNumber = false;
+							}
+
+							// Only add space to display if we're not at the beginning
+							if (inputIndex > 0 && inputBuffer[inputIndex - 1] != ' ') {
+								inputBuffer[inputIndex++] = ' ';
+								printf(" ");
+							}
+						}
+						// Accept hex characters for byte values
+						else if (((inputChar >= '0' && inputChar <= '9') ||
+							(inputChar >= 'a' && inputChar <= 'f') ||
+							(inputChar >= 'A' && inputChar <= 'F')) &&
+							inputIndex < sizeof(inputBuffer) - 1) {
+
+							// Add to the display buffer
+							inputBuffer[inputIndex++] = (char)inputChar;
+							printf("%c", inputChar);
+
+							// Add to current byte value (max 2 hex digits)
+							if (tempIndex < 2) {
+								tempHexByte[tempIndex++] = (char)inputChar;
+								inNumber = true;
+							}
+							// If we already have 2 digits, complete this byte and start a new one
+							else {
+								byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
+								bytesToWrite.push_back(byteVal);
+
+								// Reset for next byte and add the current character
+								memset(tempHexByte, 0, sizeof(tempHexByte));
+								tempHexByte[0] = (char)inputChar;
+								tempIndex = 1;
+							}
+						}
+					}
+
+					// Process any remaining bytes
+					if (inNumber && tempIndex > 0) {
+						byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
+						bytesToWrite.push_back(byteVal);
+					}
+
+					printf("\n");
+
+					// Write the bytes to memory
+					if (!bytesToWrite.empty()) {
+						// Get pointer to the specified memory location
+						memPtr = (unsigned char*)sourceVA + offset;
+						size_t bytesCount = bytesToWrite.size();
+
+						// Ensure we don't write beyond allocated memory
+						if (offset + bytesCount > 4096) {
+							printf("[-] Warning: Attempting to write beyond buffer boundary!\n");
+							bytesCount = 4096 - offset; // Limit to available bytes
+						}
+
+						// Display original values
+						printf("Original values at offset 0x%X:", offset);
+						for (size_t i = 0; i < bytesCount; i++) {
+							printf(" %02X", memPtr[i]);
+						}
+						printf("\n");
+
+						// Write the new values
+						for (size_t i = 0; i < bytesCount; i++) {
+							memPtr[i] = bytesToWrite[i];
+						}
+
+						// Display the new values
+						printf("New values written at offset 0x%X:", offset);
+						for (size_t i = 0; i < bytesCount; i++) {
+							printf(" %02X", memPtr[i]);
+						}
+						printf("\n");
+						printf("[+] Successfully wrote %zu bytes\n", bytesCount);
+					}
+					else {
+						printf("[-] No valid byte values entered\n");
+					}
+				}
+				break;
+			case 'm':
+			case 'M':
+				// Set memory view size by assigning the input to targetVPNSize
+				// Buffer to hold the input
+				sizeIndex = 0;
+
+				printf("Enter memory view size (decimal or hex with 0x prefix): ");
+				fflush(stdout);
+
+				// Read characters until Enter is pressed
+				inputChar = 0;
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (sizeIndex > 0) {
+							sizeIndex--;
+							sizeBuffer[sizeIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Accept decimal digits and hex characters (for 0x prefix)
+					else if ((inputChar >= '0' && inputChar <= '9') ||
+						(inputChar >= 'a' && inputChar <= 'f') ||
+						(inputChar >= 'A' && inputChar <= 'F') ||
+						inputChar == 'x' || inputChar == 'X') {
+
+						if (sizeIndex < sizeof(sizeBuffer) - 1) {
+							sizeBuffer[sizeIndex++] = (char)inputChar;
+							printf("%c", inputChar); // Echo the character
+						}
+					}
+				}
+
+				// Null-terminate the string
+				sizeBuffer[sizeIndex] = '\0';
+				printf("\n");
+
+				// Convert the string to a number
+				if (sizeIndex > 0) {
+					// Handle both decimal and hex inputs
+					if (strncmp(sizeBuffer, "0x", 2) == 0 || strncmp(sizeBuffer, "0X", 2) == 0) {
+						// Hex input
+						targetVPNSize = (size_t)strtoull(sizeBuffer + 2, NULL, 16);
+					}
+					else {
+						// Decimal input
+						targetVPNSize = (size_t)strtoull(sizeBuffer, NULL, 10);
+					}
+
+					printf("[*] Memory view size set to: %zu bytes\n", targetVPNSize);
+				}
+				else {
+					printf("[*] No input provided, memory view size not changed\n");
+				}
+				break;
+
+			case '\n':
+			case '\r':  // Handle Enter presses
+				break;
+			// Add this case to your command processing switch statement:
+			case 'p':
+			case 'P':
+				// Get the pattern from the user
+				printf("Enter hex pattern to search for (e.g. '90 90 ? ? FF' or '4142??44'): ");
+
+				patternIndex = 0;
+
+				// Read the pattern directly with _getch for consistency with rest of UI
+				patternChar = 0;
+				while ((patternChar = _getch()) != '\r' && patternChar != '\n' && patternIndex < 255) {
+					// Handle backspace
+					if (patternChar == '\b') {
+						if (patternIndex > 0) {
+							patternIndex--;
+							pattern[patternIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Only accept valid hex chars, wildcards, and spaces
+					else if (isxdigit(patternChar) || patternChar == '?' || patternChar == ' ') {
+						pattern[patternIndex++] = (char)patternChar;
+						printf("%c", patternChar); // Echo the character
+					}
+				}
+
+				printf("\n");
+				pattern[patternIndex] = '\0'; // Ensure null termination
+
+				// Verify we have a pattern
+				if (strlen(pattern) == 0) {
+					printf("[-] No pattern provided\n");
+					break;
+				}
+
+				// Make sure we have VAD data
+				//if (!VADArray || !VADArrayFileName) {
+					if (!sourceVA) {
+					printf("[-] VAD data not available. Run option 1 first to populate VAD tree\n");
+					break;
+				}
+
+
+				SecBase = VADArray;
+				SecSize = 4096 * 4;
+				FileNameSecBase = VADArrayFileName;
+				FileNameSecSize = 4096 * 4;
+				if (SecBase == NULL)
+					break;
+
+				node = (PVAD_NODE)SecBase;
+				FileNameBase = (PVAD_NODE_FILE)FileNameSecBase;
+
+				// Calculate maximum symbols based on remaining size
+				maxSymCount = SecSize / sizeof(VAD_NODE);
+
+				//__try {
+					for (size_t i = 0; i < maxSymCount - 1; i++) {
+						if (!continueScan)
+							break;
+						if (node[i].Level == 0)
+							continue; // Skip if Level is 0
+
+						prot = (PROTECTION)node[i].Protection;
+						protStr = ProtectionToStr(prot);
+						rangeSize = node[i].EndingVpn - node[i].StartingVpn;
+
+						currentVPN = node[i].StartingVpn;
+						pages = node[i].EndingVpn - node[i].StartingVpn;
+
+						for (size_t currPage = 0; currPage < pages; currPage++) { // TODO: < or <= ?
+							if (!continueScan)
+								break;
+							// Update the kernel with the new targetVPN
+							targetVPN = currentVPN;
+							UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+
+							if (SetEvent(hEventLINK)) { // TODO: Should all be CLI controlled? Like this we will Link
+								printf("[*] Notified driver to link to VAD-Tree Node\n");
+							}
+							else {
+								printf("[-] Failed to notified driver to link to VAD-Tree Node: %d\n", GetLastError());
+							}
+							// Perform the scan
+							if (ScanAndPrintMemory(sourceVA, pattern))
+								continueScan = false;
+							currentVPN += 0x1000; // Increment by 4KB
+						}
+					}
+					continueScan = true; // Reset for next scan
+				//}
+				//__except (EXCEPTION_EXECUTE_HANDLER) {
+				//	printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
+				//}
+				break;
+			default:
+				printf("Unknown command '%c'. Try:\n", ch);
+				ShowHelp();
+				break;
+			}
 		}
-	}
-
+	
 cleanup:
-	// Cleanup code
-	//if (VADArray) {
-	//	UnmapViewOfFile(VADArray);
-	//}
-	//if (hVADMapFile) {
-	//	CloseHandle(hVADMapFile);
-	//}
-	//if (VADArrayFileName) {
-	//	UnmapViewOfFile(VADArrayFileName);
-	//}
-	//if (hVADMapFileName) {
-	//	CloseHandle(hVADMapFileName);
-	//}
-	//if (SymbolsArray) {
-	//	UnmapViewOfFile(SymbolsArray);
-	//}
-	//if (hMapFile) {
-	//	CloseHandle(hMapFile);
-	//}
 	printf("Unlink memory at source VA:\n");
 	if (SetEvent(hEventUnlink)) {
 		printf("[*] Event set successfully\n");
@@ -1290,11 +1865,5 @@ cleanup:
 	else {
 		printf("[-] Failed to set event: %d\n", GetLastError());
 	}
-	while (true) {
-
-	}
-	//printf("[*] Cleanup symbol_ctx (NOT)\n");
-	//UnloadSymbols(sym_ctxNtskrnl, false); // TODO: This has to be properly Unloaded
-
 	return 0;
 }
