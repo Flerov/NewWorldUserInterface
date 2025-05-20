@@ -59,8 +59,8 @@ typedef struct _DEVICE_CONTEXT
 	PDEVICE_OBJECT  pDeviceObject;        // device object ptr
 	HANDLE			hSection;             // section handle
 	HANDLE			hSectionFileName;	  // section handle for FileName
-	MDL*			pMdl;                 // memory descriptor list
-	MDL*			pFileNameMdl;         // memory descriptor list for FileName
+	MDL* pMdl;                 // memory descriptor list
+	MDL* pFileNameMdl;         // memory descriptor list for FileName
 	BOOLEAN			gSectionMapped;
 	BOOLEAN			gFileNameSectionMapped;
 }
@@ -77,6 +77,7 @@ typedef struct _VAD_NODE {
 	PVOID VADNode;
 	unsigned long long StartingVpn;
 	unsigned long long EndingVpn;
+	unsigned long Protection;
 	//WCHAR FileName[MAX_FILENAME_SIZE];
 	//CHAR FileName[MAX_FILENAME_SIZE];
 	UCHAR FileOffset;
@@ -267,3 +268,29 @@ typedef struct _PHYSICAL_4KB {
 		ULONG64 Value;
 	};
 } PHYSICAL_4KB, * PPHYSICAL_4KB;
+// -----------------------------------------------------------------
+// The Windows Header Flags for Protections are wrong WTF. So we reverse and redefine them.
+typedef enum _PROTECTION
+{
+	_PAGE_READONLY = 0x01, // Read-only access to the page
+	_PAGE_READWRITE = 0x04, // Read and write access to the page
+	_PAGE_WRITECOPY = 0x07, // Copy-on-write access to the page
+	_PAGE_EXECUTE = 0x10, // Execute access to the page
+	_PAGE_NOACCESS = 0x18, // No access to the page
+	_PAGE_EXECUTE_READ = 0x20  // Execute and read access to the page
+} PROTECTION;
+// -----------------------------------------------------------------
+typedef union _MMVAD_FLAGS {
+	struct {
+		unsigned long Lock : 1; // Bit 0:0
+		unsigned long LockContended : 1; // Bit 1:1
+		unsigned long DeleteInProgress : 1; // Bit 2:2
+		unsigned long NoChange : 1; // Bit 3:3
+		unsigned long VadType : 3; // Bit 4:6
+		unsigned long Protection : 5; // Bit 7:11
+		unsigned long PreferredNode : 6; // Bit 12:17
+		unsigned long PageSize : 20; // Bit 18:19
+		unsigned long PrivateMemory : 1; // Bit 20:20
+	};
+	unsigned long LongFlags;
+} MMVAD_FLAGS;
