@@ -66,7 +66,7 @@ NTSTATUS DriverInitialize(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pusRegis
 void DriverUnload(PDRIVER_OBJECT pDriverObject) {
 	//if (gSymbolList != NULL)
 	//	ExFreePool(gSymbolList);
-	
+
 	//ZwClose(hEventLINK);
 	//ZwClose(hEventUnlink);
 	//ZwClose(hEventINIT);
@@ -159,7 +159,8 @@ BOOL InsertVADNode(int Level,
 	PVOID VADNode,
 	unsigned long long StartingVpn,
 	unsigned long long EndingVpn,
-	UNICODE_STRING* FileName) {
+	UNICODE_STRING* FileName,
+	unsigned long Protection) {
 
 	if (gViewSize / sizeof(VAD_NODE) <= gSecVADIndex) {
 		DbgPrint("[-] VAD node index out of bounds\n");
@@ -172,12 +173,13 @@ BOOL InsertVADNode(int Level,
 
 	PVAD_NODE CurrVADNode = (PVAD_NODE)gSection;
 	PVAD_NODE_FILE FileNameBuffer = (PVAD_NODE_FILE)gFileNameSection;
-	
+
 	CurrVADNode[gSecVADIndex].Level = Level;
 	CurrVADNode[gSecVADIndex].VADNode = VADNode;
 	CurrVADNode[gSecVADIndex].StartingVpn = StartingVpn;
 	CurrVADNode[gSecVADIndex].EndingVpn = EndingVpn;
 	CurrVADNode[gSecVADIndex].FileOffset = 0;
+	CurrVADNode[gSecVADIndex].Protection = Protection;
 	if (FileName != NULL && FileName->Length > 0 && FileName->Length < gViewSize) {
 		ANSI_STRING test;
 		if (NT_SUCCESS(RtlUnicodeStringToAnsiString(
@@ -190,7 +192,8 @@ BOOL InsertVADNode(int Level,
 			CurrVADNode[gSecVADIndex].FileOffset = gCurrFileNameOffset;
 			RtlFreeAnsiString(&test);
 			gCurrFileNameOffset++;
-		} else {
+		}
+		else {
 			DbgPrint("[-] Failed to convert FileName to ANSI\n");
 		}
 	}
@@ -241,6 +244,18 @@ UNICODE_STRING* GetFileObjectFromVADLeaf(unsigned long long Leaf, DWORD MMVADSub
 	return FileName;
 }
 // -----------------------------------------------------------------
+const char* ProtectionToStr(PROTECTION prot) {
+	switch (prot) {
+	case _PAGE_NOACCESS:     return "PAGE_NOACCESS";
+	case _PAGE_READONLY:     return "PAGE_READONLY";
+	case _PAGE_READWRITE:    return "PAGE_READWRITE";
+	case _PAGE_WRITECOPY:    return "PAGE_WRITECOPY";
+	case _PAGE_EXECUTE:      return "PAGE_EXECUTE";
+	case _PAGE_EXECUTE_READ: return "PAGE_EXECUTE_READ";
+	default:                   return "UNKNOWN_PROTECTION";
+	}
+}
+// -----------------------------------------------------------------
 VOID WalkVADRecursive(PVOID VADNode, unsigned long StartingVpnOffset, DWORD EndingVpnOffset,
 	DWORD Left, DWORD Right, int Level,
 	PULONG TotalVADs, PULONG TotalLevels, PULONG MaxDepth,
@@ -283,6 +298,10 @@ VOID WalkVADRecursive(PVOID VADNode, unsigned long StartingVpnOffset, DWORD Endi
 	BOOLEAN isTargetInRange = FALSE;
 
 	UNICODE_STRING* FileName = GetFileObjectFromVADLeaf(VADNode, MMVADSubsection, MMVADControlArea, MMVADCAFilePointer, FILEOBJECTFileName);
+	MMVAD_FLAGS Flags = *(MMVAD_FLAGS*)((ULONG_PTR)VADNode + 0x30); // MMVAD_FLAGS <anonymous-tag> ._.
+
+	//PROTECTION VADProt = Flags.Protection;
+	//DbgPrint("Protection: %s [0x%lx] | Private Memory: %lx | Node: 0x%llx\n", ProtectionToStr(VADProt), VADProt, Flags.PrivateMemory, VADNode);
 
 	// Print current node with fixed width formatting
 	// Add indicator if this range contains the target address
@@ -301,7 +320,7 @@ VOID WalkVADRecursive(PVOID VADNode, unsigned long StartingVpnOffset, DWORD Endi
 	//		EndingVpn,
 	//		FileName);
 	//}
-	InsertVADNode(Level, VADNode, StartingVpn, EndingVpn, FileName);
+	InsertVADNode(Level, VADNode, StartingVpn, EndingVpn, FileName, Flags.Protection);
 
 	// Get left and right children
 	PVOID LeftChild = *(PVOID*)((ULONG_PTR)VADNode + Left);
@@ -320,19 +339,20 @@ VOID WalkVADRecursive(PVOID VADNode, unsigned long StartingVpnOffset, DWORD Endi
 		targetAdr);
 }
 // -----------------------------------------------------------------
-VOID WalkVAD(  PEPROCESS TargetProcess,
-						  DWORD VADRootOffset,
-						  DWORD StartingVpnOffset,
-						  DWORD EndingVpnOffset,
-						  DWORD Left,
-						  DWORD Right,
-						  DWORD MMVADSubsection,
-						  DWORD MMVADControlArea,
-						  DWORD MMVADCAFilePointer,
-						  DWORD FILEOBJECTFileName,
-						  unsigned long long targetAdr  ) {
+VOID WalkVAD(PEPROCESS TargetProcess,
+	DWORD VADRootOffset,
+	DWORD StartingVpnOffset,
+	DWORD EndingVpnOffset,
+	DWORD Left,
+	DWORD Right,
+	DWORD MMVADSubsection,
+	DWORD MMVADControlArea,
+	DWORD MMVADCAFilePointer,
+	DWORD FILEOBJECTFileName,
+	unsigned long long targetAdr) {
 
 	PVOID* pVADRoot = (PVOID*)((ULONG_PTR)TargetProcess + VADRootOffset);
+	DbgPrint("[*] WalkVAD: TargetProcess: 0x%llx | VADRoot: 0x%llx\n", TargetProcess, *pVADRoot);
 	if (!MmIsAddressValid(*pVADRoot)) {
 		DbgPrint("[-] VAD tree is empty | *pVADRoot: 0x%llx -> TargetProcess: 0x%llx + VADRootOffset: 0x%lx\n", *pVADRoot, TargetProcess, VADRootOffset);
 		return;
@@ -355,10 +375,10 @@ VOID WalkVAD(  PEPROCESS TargetProcess,
 		targetAdr);
 
 	// Calculate and print statistics
-	//ULONG avgLevel = (totalVADs > 0) ? totalLevels / totalVADs : 0;
-	//ULONG avgLevelFrac = (totalVADs > 0) ? ((totalLevels * 100) / totalVADs) % 100 : 0;
-	//DbgPrint("Total VADs: %lu, average level: %lu.%02lu, maximum depth: %lu\n\n",
-	//	totalVADs, avgLevel, avgLevelFrac, maxDepth);
+	ULONG avgLevel = (totalVADs > 0) ? totalLevels / totalVADs : 0;
+	ULONG avgLevelFrac = (totalVADs > 0) ? ((totalLevels * 100) / totalVADs) % 100 : 0;
+	DbgPrint("Total VADs: %lu, average level: %lu.%02lu, maximum depth: %lu\n\n",
+		totalVADs, avgLevel, avgLevelFrac, maxDepth);
 }
 // -----------------------------------------------------------------
 PEPROCESS GetProcessByName(
@@ -458,8 +478,8 @@ VOID ChangeRef(
 	DbgPrint("Get for Target\n");
 	// Extract the PFN
 	KeStackAttachProcess(TargetProcess, &ApcState);
-	MDL* pMdlTarget = IoAllocateMdl(TargetVA, 4096, FALSE, FALSE, NULL);
-	MmProbeAndLockPages(pMdlTarget, UserMode, IoReadAccess);
+	//MDL* pMdlTarget = IoAllocateMdl(TargetVA, 4096, FALSE, FALSE, NULL);
+	//MmProbeAndLockPages(pMdlTarget, UserMode, IoReadAccess);
 
 	PML4Offset = (TargetVA & 0xFF8000000000) >> 0x27; // Page Map Level 4 Offset
 	PDPTOffset = (TargetVA & 0x7FC0000000) >> 0x1E;   // Page Directory Pointer Table Offset
@@ -506,15 +526,15 @@ VOID ChangeRef(
 	else {
 		PHYSRaw1GB = (PHYSICAL_1GB*)&pdpte;
 	}
-	MmUnlockPages(pMdlTarget);
-	IoFreeMdl(pMdlTarget);
+	//MmUnlockPages(pMdlTarget);
+	//IoFreeMdl(pMdlTarget);
 	KeUnstackDetachProcess(&ApcState);
 
 	// Source Process
 	DbgPrint("Get for Source\n");
 	KeStackAttachProcess(SourceProcess, &ApcState);
-	MDL* pMdlSource = IoAllocateMdl(SourceVA, 4096, FALSE, FALSE, NULL);
-	MmProbeAndLockPages(pMdlSource, UserMode, IoReadAccess);
+	//MDL* pMdlSource = IoAllocateMdl(SourceVA, 4096, FALSE, FALSE, NULL);
+	//MmProbeAndLockPages(pMdlSource, UserMode, IoReadAccess);
 
 	PML4Offset = (SourceVA & 0xFF8000000000) >> 0x27; // Page Map Level 4 Offset
 	PDPTOffset = (SourceVA & 0x7FC0000000) >> 0x1E;   // Page Directory Pointer Table Offset
@@ -547,7 +567,8 @@ VOID ChangeRef(
 			Phys.PhysicalAddress.QuadPart = PhysPage.PhysicalAddress.QuadPart + MaskOffset;
 			status = MmCopyMemory(&physAdr, Phys, sizeof(physAdr), MM_COPY_MEMORY_PHYSICAL, &numRec);
 			gOrigPhys.QuadPart = Phys.PhysicalAddress.QuadPart;
-			gOrigVal = physAdr;
+			if (gOrigVal == 0x0) // Check if the original value is not set
+				gOrigVal = physAdr;
 			physAdr = physAdr & 0xFFFFFFFFFFFF; // Mask out the upper bits
 			DbgPrint("Source PTE: 0x%llx\n", physAdr);
 			PTERaw = (PTE*)&physAdr;
@@ -570,16 +591,16 @@ VOID ChangeRef(
 		DbgPrint("Changing PFN to TargetPFN: 0x%llx - 0x%llx\n", temp->Value, TargetPFN);
 		memcpy(temp, &TargetPFN, sizeof(TargetPFN)); // the size should be correct
 		DbgPrint("CHANGED\n");
-		__invlpg(SourceVA);
-		MmUnlockPages(pMdlSource);
-		IoFreeMdl(pMdlSource);
+		//__invlpg(SourceVA);
+		//MmUnlockPages(pMdlSource);
+		//IoFreeMdl(pMdlSource);
 		KeUnstackDetachProcess(&ApcState);
 		return;
 	}
 	else {
 		DbgPrint("[-] PTERaw is NULL\n");
-		MmUnlockPages(pMdlSource);
-		IoFreeMdl(pMdlSource);
+		//MmUnlockPages(pMdlSource);
+		//IoFreeMdl(pMdlSource);
 		KeUnstackDetachProcess(&ApcState);
 	}
 	DbgPrint("Returning\n");
@@ -619,8 +640,8 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 	PHYSICAL_4KB* PHYSRaw4KB = 0x0; // Page
 
 	KeStackAttachProcess(TargetProcess, &ApcState);
-	MDL* pMdl = IoAllocateMdl(addr, 4096, FALSE, FALSE, NULL);
-	MmProbeAndLockPages(pMdl, UserMode, IoReadAccess);
+	//MDL* pMdl = IoAllocateMdl(addr, 4096, FALSE, FALSE, NULL);
+	//MmProbeAndLockPages(pMdl, UserMode, IoReadAccess);
 
 	// walk PML4 -> Physical
 	PhysPML4.PhysicalAddress.QuadPart = cr3 + (PML4Offset * 0x08);
@@ -656,8 +677,8 @@ VOID VirtToPhys(unsigned long long addr, PEPROCESS TargetProcess, unsigned long 
 	else {
 		PHYSRaw1GB = (PHYSICAL_1GB*)&pdpte;
 	}
-	MmUnlockPages(pMdl);
-	IoFreeMdl(pMdl);
+	//MmUnlockPages(pMdl);
+	//IoFreeMdl(pMdl);
 
 	if (log) {
 		DbgPrint("[+] cr3: 0x%llx\n", cr3);
@@ -903,13 +924,13 @@ VOID UserModeReadWorkerThread(PVOID Context) {
 		// Make sure section is not getting paged-out | VAD Node Info - Memory Section
 		DbgPrint("[+] Allocating MDL for section\n");
 		gpDeviceContext->pMdl = IoAllocateMdl(gSection, gViewSize, FALSE, FALSE, NULL);
-		DbgPrint("[+] Probing and locking pages\n");
-		MmProbeAndLockPages(gpDeviceContext->pMdl, KernelMode, IoReadAccess);
+		//DbgPrint("[+] Probing and locking pages\n");
+		//MmProbeAndLockPages(gpDeviceContext->pMdl, KernelMode, IoReadAccess);
 		// Make sure section is not getting paged-out | VAD Node FileName Info - Memory Section
-		DbgPrint("[+] Allocating MDL for section for FileName\n");
-		gpDeviceContext->pFileNameMdl = IoAllocateMdl(gFileNameSection, gFileNameViewSize, FALSE, FALSE, NULL);
-		DbgPrint("[+] Probing and locking pages for FileName\n");
-		MmProbeAndLockPages(gpDeviceContext->pFileNameMdl, KernelMode, IoReadAccess);
+		//DbgPrint("[+] Allocating MDL for section for FileName\n");
+		//gpDeviceContext->pFileNameMdl = IoAllocateMdl(gFileNameSection, gFileNameViewSize, FALSE, FALSE, NULL);
+		//DbgPrint("[+] Probing and locking pages for FileName\n");
+		//MmProbeAndLockPages(gpDeviceContext->pFileNameMdl, KernelMode, IoReadAccess);
 
 		DbgPrint("[+] Source Process: %s\n", gInit.sourceProcess);
 		DbgPrint("[+] Target Process: %s\n", gInit.targetProcess);
@@ -924,11 +945,11 @@ VOID UserModeReadWorkerThread(PVOID Context) {
 				gSymInfo.MMVADCAFilePointer, gSymInfo.FILEOBJECTFileName, 0x0);
 		}
 
-		MmUnlockPages(gpDeviceContext->pMdl);
-		IoFreeMdl(gpDeviceContext->pMdl);
+		//MmUnlockPages(gpDeviceContext->pMdl);
+		//IoFreeMdl(gpDeviceContext->pMdl);
 
-		MmUnlockPages(gpDeviceContext->pFileNameMdl);
-		IoFreeMdl(gpDeviceContext->pFileNameMdl);
+		//MmUnlockPages(gpDeviceContext->pFileNameMdl);
+		//IoFreeMdl(gpDeviceContext->pFileNameMdl);
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -943,7 +964,6 @@ VOID INITWorkerThread(PVOID Context) {
 			break;
 		}
 		if (pInSection == NULL) {
-			//RtlZeroMemory(pInSection, gSymsViewSize);
 			status = ZwMapViewOfSection(hInSection, ZwCurrentProcess(), &pInSection,
 				0, 0, NULL, &gSymsViewSize, ViewShare,
 				0, PAGE_READONLY);
@@ -957,75 +977,22 @@ VOID INITWorkerThread(PVOID Context) {
 			DbgPrint("[+] Initializing Sym Info\n");
 			if (!InitSymInfo()) {
 				DbgPrint("[-] Failed to initialize symbol information\n");
-				//ExFreePool(gSymbolList);
-				//IoDeleteSymbolicLink(&usSymbolicLinkName);
-				//IoDeleteDevice(gpDeviceObject);
 				return STATUS_UNSUCCESSFUL;
 			}
 		}
 		DbgPrint("[+] Initializing INIT Data %llx\n", status);
 		if (!InitData()) {
 			DbgPrint("[-] Failed to initialize data\n");
-			//ExFreePool(gSymbolList);
-			//IoDeleteSymbolicLink(&usSymbolicLinkName);
-			//IoDeleteDevice(gpDeviceObject);
 			return STATUS_UNSUCCESSFUL;
 		}
 		DbgPrint("[+] Finished initializing data and symbol information\n");
 		DbgPrint("[+] Source Process: %s\n", gInit.sourceProcess);
 		DbgPrint("[+] Target Process: %s\n", gInit.targetProcess);
-
-
-		//// Make sure section is not getting paged-out
-		//MDL* pInMdl = IoAllocateMdl(pInSection, gSymsViewSize, FALSE, FALSE, NULL);
-		//MmProbeAndLockPages(pInMdl, KernelMode, IoReadAccess);
-		//
-		//// Allocate enough space for INPUT section' content
-		//gSymbolList = ExAllocatePool(NonPagedPool, gSymsViewSize);
-		//if (!(gSymbolList == NULL)) {
-		//	memcpy(gSymbolList, pInSection, gSymsViewSize);
-		//	DbgPrint("[*] Section size: %zu Bytes | Section Base: 0x%llx | SymbolList Base: 0x%llx\n",
-		//		gSymsViewSize, pInSection, gSymbolList);
-		//}
-		//else {
-		//	DbgPrint("[-] Failed to allocate memory for input section: %llx\n", status);
-		//	MmUnlockPages(pInMdl);
-		//	IoFreeMdl(pInMdl);
-		//	ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-		//	ZwClose(hInSection);
-		//	IoDeleteSymbolicLink(&usSymbolicLinkName);
-		//	IoDeleteDevice(gpDeviceObject);
-		//	return status;
-		//}
-		//DbgPrint("[+] Input section mapped successfully: %llx\n", status);
-		//MmUnlockPages(pInMdl);
-		//IoFreeMdl(pInMdl);
-		////ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-		////ZwClose(hInSection);
-		//
-		//DbgPrint("[+] Initializing INIT Data %llx\n", status);
-		//if (!InitData()) {
-		//	DbgPrint("[-] Failed to initialize data\n");
-		//	ExFreePool(gSymbolList);
-		//	IoDeleteSymbolicLink(&usSymbolicLinkName);
-		//	IoDeleteDevice(gpDeviceObject);
-		//	return STATUS_UNSUCCESSFUL;
-		//}
-		//DbgPrint("[+] Initializing Sym Info\n");
-		//if (!InitSymInfo()) {
-		//	DbgPrint("[-] Failed to initialize symbol information\n");
-		//	ExFreePool(gSymbolList);
-		//	IoDeleteSymbolicLink(&usSymbolicLinkName);
-		//	IoDeleteDevice(gpDeviceObject);
-		//	return STATUS_UNSUCCESSFUL;
-		//}
-		//DbgPrint("[+] Finished initializing data and symbol information\n");
-		//pEvent->Header.SignalState = 0; // Reset the event
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
-NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
-					   PUNICODE_STRING pusRegistryPath  ) {
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
+	PUNICODE_STRING pusRegistryPath) {
 
 	NTSTATUS status = STATUS_DEVICE_CONFIGURATION_ERROR;
 
@@ -1046,7 +1013,7 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		RtlSetDaclSecurityDescriptor(&sdInSecurityDescriptor, TRUE, NULL, FALSE);
 		RtlInitUnicodeString(&InSectionName, MAPPING_NAME_INPUT);
 		InitializeObjectAttributes(&InAttr, &InSectionName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdInSecurityDescriptor);
-		
+
 		//status = ZwOpenSection(&hInSection, SECTION_MAP_READ, &InAttr); // TODO: I think this can stay User-Mode
 		status = ZwCreateSection(&hInSection, SECTION_ALL_ACCESS | SECTION_MAP_WRITE,
 			&InAttr, &InSecSize, PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL); // why can we not specify maximum sizeLow but only maximum sizeHigh????
@@ -1071,7 +1038,7 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		UNICODE_STRING sectionName;
 		PVOID sectionObject = NULL;
 		LARGE_INTEGER sectionSize;
-		sectionSize.QuadPart = 0x3000; // or whatever size you want, 4KB in this case
+		sectionSize.QuadPart = 0x4000; // or whatever size you want, 4KB in this case
 		SECURITY_DESCRIPTOR sdSecurityDescriptor;
 		ACL sdAcl;
 		RtlCreateSecurityDescriptor(&sdSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION);
@@ -1109,12 +1076,6 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		DbgPrint("[+] Section size: %zu Bytes | Section Base: 0x%llx\n",
 			gViewSize, gSection);
 
-		// Make sure section is not getting paged-out
-		//DbgPrint("[+] Allocating MDL for section\n");
-		//gpDeviceContext->pMdl = IoAllocateMdl(gSection, gViewSize, FALSE, FALSE, NULL);
-		//DbgPrint("[+] Probing and locking pages\n");
-		//MmProbeAndLockPages(gpDeviceContext->pMdl, KernelMode, IoReadAccess);
-
 		gpDeviceContext->gSectionMapped = TRUE;
 		// -----------------------------------------------------------------
 		// Section for FileName-Info from Driver
@@ -1122,7 +1083,7 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		UNICODE_STRING sectionFileName;
 		PVOID sectionFileNameObject = NULL;
 		LARGE_INTEGER sectionSizeFILENAMES;
-		sectionSizeFILENAMES.QuadPart = 0x2000; // or whatever size you want, 4KB in this case
+		sectionSizeFILENAMES.QuadPart = 0x4000; // or whatever size you want, 4KB in this case
 
 		DbgPrint("[+] Initializing Section Name for FileName\n");
 		RtlInitUnicodeString(&sectionFileName, MAPPING_NAME_FROM_FILENAMES);
@@ -1157,12 +1118,6 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		DbgPrint("[+] Section size for FileName: %zu Bytes | Section Base: 0x%llx\n",
 			gFileNameViewSize, gFileNameSection);
 
-		// Make sure section is not getting paged-out
-		//DbgPrint("[+] Allocating MDL for section for FileName\n");
-		//gpDeviceContext->pFileNameMdl = IoAllocateMdl(gFileNameSection, gFileNameViewSize, FALSE, FALSE, NULL);
-		//DbgPrint("[+] Probing and locking pages for FileName\n");
-		//MmProbeAndLockPages(gpDeviceContext->pFileNameMdl, KernelMode, IoReadAccess);
-
 		gpDeviceContext->gFileNameSectionMapped = TRUE;
 		// -----------------------------------------------------------------
 		// MAPPING_NOTIFICATION_USERMODEREADY_EVENT START
@@ -1172,7 +1127,6 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		PKEVENT pEventUSERMODEREADY;
 		RtlInitUnicodeString(&eventNameUSERMODEREADY, MAPPING_NOTIFICATION_USERMODEREADY_EVENT);
 		InitializeObjectAttributes(&objAttrUSERMODEREADY, &eventNameUSERMODEREADY, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		//status = ZwOpenEvent(&hEventUSERMODEREADY, EVENT_ALL_ACCESS, &objAttrUSERMODEREADY);
 		status = ZwCreateEvent(&hEventUSERMODEREADY, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUSERMODEREADY, NotificationEvent, FALSE);
 		if (NT_SUCCESS(status)) {
 			DbgPrint("[+] Opened event handle: %llx\n", hEventUSERMODEREADY);
@@ -1196,7 +1150,6 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		PKEVENT pEventUnlink;
 		RtlInitUnicodeString(&eventNameUnlink, MAPPING_NOTIFICATION_Unlink_EVENT);
 		InitializeObjectAttributes(&objAttrUnlink, &eventNameUnlink, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		//status = ZwOpenEvent(&hEventUnlink, EVENT_ALL_ACCESS, &objAttrUnlink);
 		status = ZwCreateEvent(&hEventUnlink, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUnlink, NotificationEvent, FALSE);
 		if (NT_SUCCESS(status)) {
 			DbgPrint("[+] Opened event handle: %llx\n", hEventUnlink);
@@ -1222,7 +1175,6 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		PKEVENT pEventLINK;
 		RtlInitUnicodeString(&eventNameLINK, MAPPING_NOTIFICATION_LINK_EVENT);
 		InitializeObjectAttributes(&objAttrLINK, &eventNameLINK, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		//status = ZwOpenEvent(&hEventLINK, EVENT_ALL_ACCESS, &objAttrLINK);
 		status = ZwCreateEvent(&hEventLINK, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrLINK, NotificationEvent, FALSE);
 		if (NT_SUCCESS(status)) {
 			DbgPrint("[+] Opened event handle: %llx\n", hEventLINK);
@@ -1234,7 +1186,7 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 			ObDereferenceObject(hEventUSERMODEREADY);
 			ObDereferenceObject(hEventUnlink);
 			ZwClose(gpDeviceContext->hSection);
-			ZwClose(gpDeviceContext->hSectionFileName); 
+			ZwClose(gpDeviceContext->hSectionFileName);
 			ZwClose(hEventUSERMODEREADY);
 			ZwClose(hEventUnlink);
 			IoDeleteSymbolicLink(&usSymbolicLinkName);
@@ -1271,7 +1223,8 @@ NTSTATUS DriverEntry(  PDRIVER_OBJECT pDriverObject,
 		status = STATUS_SUCCESS;
 		return status;
 		// END - Section for Output
-	} else {
+	}
+	else {
 		DbgPrint("[-] Failed to initialize driver: %llx\n", status);
 		IoDeleteSymbolicLink(&usSymbolicLinkName);
 		IoDeleteDevice(gpDeviceObject);
