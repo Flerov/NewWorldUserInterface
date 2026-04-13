@@ -16,10 +16,14 @@
 #define MAPPING_NAME_TO  L"Global\\MySharedMemory"
 #define MAPPING_NAME_FROM L"Global\\VADSharedMemory"
 #define MAPPING_NAME_FROM_FILENAMES L"Global\\VADSharedMemoryFileNames"
+#define MAPPING_NAME_WRITE_PHYS L"Global\\WritePhysicalMemory"
+#define MAPPING_NAME_READ_PHYS L"Global\\ReadPhysicalMemory"
 #define MAPPING_NOTIFICATION_LINK_EVENT L"Global\\LinkMemory"
 #define MAPPING_NOTIFICATION_Unlink_EVENT L"Global\\UnlinkMemory"
 #define MAPPING_NOTIFICATION_INIT_EVENT L"Global\\InitializeMemory"
 #define MAPPING_NOTIFICATION_USERMODEREADY_EVENT L"Global\\UserModeReadEvent"
+#define MAPPING_NOTIFICATION_WRITE_PHYS_EVENT L"Global\\WritePhysicalMemoryEvent"
+#define MAPPING_NOTIFICATION_READ_PHYS_EVENT L"Global\\ReadPhysicalMemoryEvent"
 // -----------------------------------------------------------------
 
 typedef struct _INIT {
@@ -28,13 +32,30 @@ typedef struct _INIT {
 	CHAR targetProcess[15];
 	unsigned long long sourceVA;
 	unsigned long long targetVPN;
-	DWORD NtBaseOffset;
+	unsigned long long NtBaseOffset;
 	DWORD KPROCDirectoryTableBaseOffset;
 	DWORD EPROCActiveProcessLinksOfsset;
 	DWORD EPROCUniqueProcessIdOffset;
+	ULONG requestedProtection;
 } INIT, * PINIT;
 // -----------------------------------------------------------------
 #define MAX_FILENAME_SIZE 80
+#define MAX_WRITE_BUFFER_SIZE 4096
+#define MAX_READ_BUFFER_SIZE 4096
+
+// Define PHYSICAL_ADDRESS for user-mode
+typedef union _PHYSICAL_ADDRESS {
+    struct {
+        ULONG LowPart;
+        LONG HighPart;
+    };
+    struct {
+        ULONG LowPart;
+        LONG HighPart;
+    } u;
+    LONGLONG QuadPart;
+} PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
+
 // -----------------------------------------------------------------
 typedef struct _VAD_NODE {
 	int Level;
@@ -67,6 +88,27 @@ typedef struct _SYMBOL {
 	unsigned long long offset;
 	LIST_ENTRY ListEntry;
 } SYMBOL, * PSYMBOL;
+// -----------------------------------------------------------------
+typedef struct _WRITE_PHYS_REQUEST {
+    CHAR identifier[4];                         // Identifier "WPHY"
+    unsigned long long targetVirtualAddress;                 // Target virtual address to resolve to physical
+    ULONG offsetInPage;                        // Offset within the 4KB page (0-4095)
+    ULONG dataSize;                            // Size of data to write (must not exceed page boundary)
+    UCHAR data[MAX_WRITE_BUFFER_SIZE];         // Data buffer
+    BOOLEAN isValid;                           // Request validity flag
+    ULONG reserved;                            // Reserved for alignment
+} WRITE_PHYS_REQUEST, *PWRITE_PHYS_REQUEST;
+
+// -----------------------------------------------------------------
+
+typedef struct _READ_PHYS_REQUEST {
+    CHAR identifier[4];                         // Identifier "RPHY"
+    PVOID targetVirtualAddress;                 // Target virtual address to resolve
+    BOOLEAN isValid;                           // Request validity flag
+    ULONG reserved;                            // Reserved for alignment
+    // The 4KB physical page content will be copied starting here
+    UCHAR pageData[MAX_READ_BUFFER_SIZE];      // Physical page data (4KB)
+} READ_PHYS_REQUEST, *PREAD_PHYS_REQUEST;
 
 // =================================================================
 // GLOBAL VARIABLES
@@ -573,10 +615,11 @@ unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD
 	return offset;
 }
 // -----------------------------------------------------------------
-BOOL AddInitData(DWORD NtBaseOffset, DWORD KPROCDirectoryTableBaseOffset, DWORD EPROCActiveProcessLinksOfsset, DWORD EPROCUniqueProcessIdOffset, const char* sourceProcess, const char* targetProcess) {
+BOOL AddInitData(unsigned long long NtBaseOffset, DWORD KPROCDirectoryTableBaseOffset, DWORD EPROCActiveProcessLinksOfsset, DWORD EPROCUniqueProcessIdOffset, const char* sourceProcess, const char* targetProcess) {
 	PINIT Data = (PINIT)SymbolsArray;
 	memcpy(Data[0].identifier, "INIT", 4);
 	Data[0].NtBaseOffset = NtBaseOffset;
+	printf("NTBaseOffset: 0x%llx\n", NtBaseOffset);
 	if (sourceProcess != NULL) {
 		size_t copyLenSource = min(strlen(sourceProcess), sizeof(Data[0].sourceProcess) - 1);
 		memcpy(Data[0].sourceProcess, sourceProcess, copyLenSource);
@@ -818,7 +861,8 @@ void GetSymOffsets(PVOID SecBase, size_t SecSize,
 void UpdateInitData(const char* sourceProcess,
 	const char* targetProcess,
 	unsigned long long sourceVA,
-	unsigned long long targetVPN) {
+	unsigned long long targetVPN,
+	ULONG newProtection) {
 	PINIT Data = (PINIT)SymbolsArray;
 	if (sourceProcess != NULL) {
 		size_t copyLenSource = min(strlen(sourceProcess), sizeof(Data[0].sourceProcess) - 1);
@@ -834,6 +878,8 @@ void UpdateInitData(const char* sourceProcess,
 		Data[0].sourceVA = sourceVA;
 	if (targetVPN != 0x0)
 		Data[0].targetVPN = targetVPN;
+	if (newProtection != 0)
+		Data[0].requestedProtection = newProtection;
 	printf("[*] InitData updated successfully\n");
 }
 void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
@@ -849,6 +895,7 @@ void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
 	if (AddInitData(ntBase, kprocDirectoryTableBase, eprocActiveProcessLinks, eprocUniqueProcessId, 0x0, 0x0))
 		printf("[*] InitData added successfully\n");
 
+	GetAndInsertSymbol("ZwProtectVirtualMemory", sym_ctxNtskrnl, 0x0, false);
 	GetAndInsertSymbol("eprocUniqueProcessId", sym_ctxNtskrnl, eprocUniqueProcessId, true); // TODO: exceution stops here???
 	GetAndInsertSymbol("eprocActiveProcessLinks", sym_ctxNtskrnl, eprocActiveProcessLinks, true);
 	GetAndInsertSymbol("kprocDirectoryTableBase", sym_ctxNtskrnl, kprocDirectoryTableBase, true);
@@ -1032,7 +1079,7 @@ bool ScanAndPrintMemory(const void* address, const char* hexPattern) {
 		}
 	//}
 	//__except (EXCEPTION_EXECUTE_HANDLER) {
-	//	printf("[-] Exception occurred while accessing memory: 0x%lx\n", GetExceptionCode());
+	//	printf("[-] Exception occurred while accessing memory: 0x%lx\n");
 	//}
 }
 
@@ -1051,6 +1098,9 @@ void ShowHelp() {
 	printf("[*] Press 'M' to set memory view size\n");
 	printf("[*] Press 'X' to unlink\n");
 	printf("[*] Press 'P' to scan memory for a pattern\n");
+	printf("[*] Press 'A' to adjust memory protection at source VA\n");
+	printf("[*] Press 'W' to write to physical memory\n");
+	printf("[*] Press 'R' to read physical memory from target VPN\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -1236,8 +1286,59 @@ int main(int argc, char* argv[]) {
 	}
 	printf("[*] MAPPING_NOTIFICATION_INIT_EVENT event opened successfully\n");
 	// TEST END
+
+	// TEST START - WritePhysical Event and Shared Memory
+	HANDLE hEventWRITE_PHYS = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_WRITE_PHYS_EVENT);
+	if (hEventWRITE_PHYS == NULL) {
+		printf("[-] Failed to open WritePhysical event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NOTIFICATION_WRITE_PHYS_EVENT event opened successfully\n");
+
+	// Open WritePhysical shared memory section
+	HANDLE hWritePhysMapFile = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_WRITE_PHYS);
+	if (!hWritePhysMapFile) {
+		printf("[-] Failed to open WritePhysical file mapping: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NAME_WRITE_PHYS file mapping opened successfully\n");
+
+	PVOID WritePhysArray = (VOID*)MapViewOfFile(hWritePhysMapFile, FILE_MAP_WRITE, 0, 0, 0);
+	if (!WritePhysArray) {
+		printf("[-] Failed to map WritePhysical file mapping: %d\n", GetLastError());
+		CloseHandle(hWritePhysMapFile);
+		return 1;
+	}
+	printf("[*] WritePhysical shared memory mapped successfully\n");
+	// TEST END
+
+	// TEST START - ReadPhysical Event and Shared Memory
+	HANDLE hEventREAD_PHYS = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_READ_PHYS_EVENT);
+	if (hEventREAD_PHYS == NULL) {
+		printf("[-] Failed to open ReadPhysical event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NOTIFICATION_READ_PHYS_EVENT event opened successfully\n");
+
+	// Open ReadPhysical shared memory section
+	HANDLE hReadPhysMapFile = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_READ_PHYS);
+	if (!hReadPhysMapFile) {
+		printf("[-] Failed to open ReadPhysical file mapping: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] MAPPING_NAME_READ_PHYS file mapping opened successfully\n");
+
+	PVOID ReadPhysArray = (VOID*)MapViewOfFile(hReadPhysMapFile, FILE_MAP_WRITE, 0, 0, 0);
+	if (!ReadPhysArray) {
+		printf("[-] Failed to map ReadPhysical file mapping: %d\n", GetLastError());
+		CloseHandle(hReadPhysMapFile);
+		return 1;
+	}
+	printf("[*] ReadPhysical shared memory mapped successfully\n");
+	// TEST END
+
 	AddInitDataSection(sym_ctxNtskrnl);
-	UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+	UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, 0);
 	if (SetEvent(hEventINIT)) {
 		printf("[*] Send User-Mode Update to Kernel\n");
 	}
@@ -1289,6 +1390,10 @@ int main(int argc, char* argv[]) {
 	unsigned long long currentVPN;
 	size_t pages;
 	bool continueScan = true;
+
+	int protectionChoice;
+	ULONG newProtection;
+	const char* protectionName;
 	// More robust command loop implementation
 	bool running = true;
 		while (running) {
@@ -1397,7 +1502,7 @@ int main(int argc, char* argv[]) {
 					printf("[*] Target VPN updated to: 0x%llx\n", targetVPN);
 
 					// Update the kernel with the new targetVPN
-					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, 0);
 					if (SetEvent(hEventINIT)) {
 						printf("[*] Sent updated targetVPN to kernel\n");
 					}
@@ -1444,7 +1549,7 @@ int main(int argc, char* argv[]) {
 
 					// Update kernel with the new sourceProcess
 					sourceProcess = procNameBufferSource;
-					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, 0);
 					if (SetEvent(hEventINIT)) {
 						printf("[*] Sent updated sourceProcess to kernel\n");
 					}
@@ -1495,7 +1600,7 @@ int main(int argc, char* argv[]) {
 
 					// Update kernel with the new targetProcess
 					targetProcess = procNameBufferTarget;
-					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, 0);
 					if (SetEvent(hEventINIT)) {
 						printf("[*] Sent updated targetProcess to kernel\n");
 					}
@@ -1604,9 +1709,9 @@ int main(int argc, char* argv[]) {
 								}
 							}
 						}
-						// Accept space to separate values
 						else if (inputChar == ' ') {
-							if (inNumber && tempIndex > 0) {
+							inNumber = false;
+							if (tempIndex > 0) {
 								// Convert and add the current byte
 								byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
 								bytesToWrite.push_back(byteVal);
@@ -1614,16 +1719,8 @@ int main(int argc, char* argv[]) {
 								// Reset for next byte
 								memset(tempHexByte, 0, sizeof(tempHexByte));
 								tempIndex = 0;
-								inNumber = false;
-							}
-
-							// Only add space to display if we're not at the beginning
-							if (inputIndex > 0 && inputBuffer[inputIndex - 1] != ' ') {
-								inputBuffer[inputIndex++] = ' ';
-								printf(" ");
 							}
 						}
-						// Accept hex characters for byte values
 						else if (((inputChar >= '0' && inputChar <= '9') ||
 							(inputChar >= 'a' && inputChar <= 'f') ||
 							(inputChar >= 'A' && inputChar <= 'F')) &&
@@ -1830,7 +1927,7 @@ int main(int argc, char* argv[]) {
 								break;
 							// Update the kernel with the new targetVPN
 							targetVPN = currentVPN;
-							UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN);
+							UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, 0);
 
 							if (SetEvent(hEventLINK)) { // TODO: Should all be CLI controlled? Like this we will Link
 								printf("[*] Notified driver to link to VAD-Tree Node\n");
@@ -1850,6 +1947,419 @@ int main(int argc, char* argv[]) {
 				//	printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
 				//}
 				break;
+			case 'a':
+			case 'A':
+				// Present memory protection options
+				printf("[*] Select memory protection for sourceVA:\n");
+				printf("  1. PAGE_READONLY (0x01)\n");
+				printf("  2. PAGE_READWRITE (0x04)\n");
+				printf("  3. PAGE_WRITECOPY (0x07)\n");
+				printf("  4. PAGE_EXECUTE (0x10)\n");
+				printf("  5. PAGE_NOACCESS (0x18)\n");
+				printf("  6. PAGE_EXECUTE_READ (0x20)\n");
+				//printf("  6. PAGE_EXECUTE_READWRITE (0x40)\n");
+				//printf("  7. PAGE_EXECUTE_WRITECOPY (0x80)\n");
+				//printf("  8. PAGE_NOACCESS (0x01)\n");
+
+				// Get user selection
+				protectionChoice = _getch() - '0';
+				printf("%d\n", protectionChoice);
+
+				// Map selection to Windows protection constants
+				newProtection = 0;
+				protectionName = "";
+				switch (protectionChoice) {
+				case 1:
+					newProtection = PAGE_READONLY;
+					protectionName = "PAGE_READONLY";
+					break;
+				case 2:
+					newProtection = PAGE_READWRITE;
+					protectionName = "PAGE_READWRITE";
+					break;
+				case 3:
+					newProtection = PAGE_WRITECOPY;
+					protectionName = "PAGE_WRITECOPY";
+					break;
+				case 4:
+					newProtection = PAGE_EXECUTE;
+					protectionName = "PAGE_EXECUTE";
+					break;
+				case 5:
+					newProtection = PAGE_EXECUTE_READ;
+					protectionName = "PAGE_EXECUTE_READ";
+					break;
+				case 6:
+					newProtection = PAGE_EXECUTE_READWRITE;
+					protectionName = "PAGE_EXECUTE_READWRITE";
+					break;
+				case 7:
+					newProtection = PAGE_EXECUTE_WRITECOPY;
+					protectionName = "PAGE_EXECUTE_WRITECOPY";
+					break;
+				case 8:
+					newProtection = PAGE_NOACCESS;
+					protectionName = "PAGE_NOACCESS";
+					break;
+				default:
+					printf("[-] Invalid selection\n");
+					break;
+				}
+
+				// Apply the selected protection if valid
+				if (newProtection != 0x0) {
+					UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, newProtection);
+					if (SetEvent(hEventINIT)) {
+						printf("[*] Send User-Mode Update to Kernel\n");
+					}
+					else {
+						printf("[-] Failed to set event: %d\n", GetLastError());
+					}
+				}
+				break;
+			case 'w':
+			case 'W': {
+				// Write to physical memory functionality
+				printf("[*] Write to Physical Memory (via Virtual Address Translation)\n");
+				printf("This function allows you to write data to a virtual address in the target process.\n");
+				printf("The kernel will translate the virtual address to physical and perform the write.\n");
+				printf("WARNING: This is a dangerous operation that can crash the system!\n\n");
+
+				// Check if we have a valid target process
+				if (targetProcess == NULL || strlen(targetProcess) == 0) {
+					printf("[-] No target process set. Please use 'O' command to set a target process first.\n");
+					break;
+				}
+
+				printf("[+] Using current target process: %s\n", targetProcess);
+
+				// Get the target virtual address
+				printf("Enter target virtual address (hex, e.g., 0x12345000): 0x");
+				fflush(stdout);
+
+				memset(inputBuffer, 0, sizeof(inputBuffer));
+				inputIndex = 0;
+
+				// Read virtual address input
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (inputIndex > 0) {
+							inputIndex--;
+							inputBuffer[inputIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Only accept hex characters (0-9, a-f, A-F)
+					else if (((inputChar >= '0' && inputChar <= '9') ||
+						(inputChar >= 'a' && inputChar <= 'f') ||
+						(inputChar >= 'A' && inputChar <= 'F')) &&
+						inputIndex < sizeof(inputBuffer) - 1) {
+
+						inputBuffer[inputIndex++] = (char)inputChar;
+						printf("%c", inputChar); // Echo the character
+					}
+				}
+
+				inputBuffer[inputIndex] = '\0';
+				printf("\n");
+
+				// Convert virtual address from hex string to pointer
+				PVOID virtualAddr = NULL;
+				if (inputIndex > 0) {
+					virtualAddr = (PVOID)strtoull(inputBuffer, NULL, 16);
+				} else {
+					printf("[-] No virtual address provided\n");
+					break;
+				}
+
+				printf("[+] Target virtual address: 0x%p\n", virtualAddr);
+
+				// Get offset within the page
+				printf("Enter offset within page (hex, 0x000-0xFFF): 0x");
+				fflush(stdout);
+
+				memset(inputBuffer, 0, sizeof(inputBuffer));
+				inputIndex = 0;
+
+				// Read offset input
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (inputIndex > 0) {
+							inputIndex--;
+							inputBuffer[inputIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+						}
+					}
+					// Only accept hex characters (0-9, a-f, A-F)
+					else if (((inputChar >= '0' && inputChar <= '9') ||
+						(inputChar >= 'a' && inputChar <= 'f') ||
+						(inputChar >= 'A' && inputChar <= 'F')) &&
+						inputIndex < sizeof(inputBuffer) - 1) {
+
+						inputBuffer[inputIndex++] = (char)inputChar;
+						printf("%c", inputChar); // Echo the character
+					}
+				}
+
+				inputBuffer[inputIndex] = '\0';
+				printf("\n");
+
+				// Convert offset from hex string to integer
+				ULONG pageOffset = 0;
+				if (inputIndex > 0) {
+					pageOffset = (ULONG)strtoul(inputBuffer, NULL, 16);
+				}
+
+				// Validate offset is within page boundary
+				if (pageOffset >= 4096) {
+					printf("[-] Offset 0x%X is outside page boundary (0x000-0xFFF)\n", pageOffset);
+					break;
+				}
+
+				// Get the data to write
+				bytesToWrite.clear();
+				printf("Enter byte values to write (hex, space-separated, e.g., 'FF 01 C3'): ");
+				fflush(stdout);
+
+				// Clear buffer for new input
+				memset(inputBuffer, 0, sizeof(inputBuffer));
+				inputIndex = 0;
+				inNumber = false;
+				tempIndex = 0;
+				memset(tempHexByte, 0, sizeof(tempHexByte));
+
+				// Read the space-separated byte values
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					// Handle backspace
+					if (inputChar == '\b') {
+						if (inputIndex > 0) {
+							inputIndex--;
+							inputBuffer[inputIndex] = '\0';
+							printf("\b \b"); // Erase character from display
+
+							// Update the temp hex byte and state
+							if (inNumber) {
+								if (tempIndex > 0) {
+									tempIndex--;
+									tempHexByte[tempIndex] = '\0';
+								}
+								if (tempIndex == 0) {
+									inNumber = false;
+								}
+							}
+						}
+					}
+					// Accept space to separate values
+					else if (inputChar == ' ') {
+						if (inNumber && tempIndex > 0) {
+							// Convert and add the current byte
+							byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
+							bytesToWrite.push_back(byteVal);
+
+							// Reset for next byte
+							memset(tempHexByte, 0, sizeof(tempHexByte));
+							tempIndex = 0;
+							inNumber = false;
+						}
+
+						// Only add space to display if we're not at the beginning
+						if (inputIndex > 0 && inputBuffer[inputIndex - 1] != ' ') {
+							inputBuffer[inputIndex++] = ' ';
+							printf(" ");
+						}
+					}
+					// Accept hex characters for byte values
+					else if (((inputChar >= '0' && inputChar <= '9') ||
+						(inputChar >= 'a' && inputChar <= 'f') ||
+						(inputChar >= 'A' && inputChar <= 'F')) &&
+						inputIndex < sizeof(inputBuffer) - 1) {
+
+						// Add to the display buffer
+						inputBuffer[inputIndex++] = (char)inputChar;
+						printf("%c", inputChar);
+
+						// Add to current byte value (max 2 hex digits)
+						if (tempIndex < 2) {
+							tempHexByte[tempIndex++] = (char)inputChar;
+							inNumber = true;
+						}
+						// If we already have 2 digits, complete this byte and start a new one
+						else {
+							byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
+							bytesToWrite.push_back(byteVal);
+
+							// Reset for next byte and add the current character
+							memset(tempHexByte, 0, sizeof(tempHexByte));
+							tempHexByte[0] = (char)inputChar;
+							tempIndex = 1;
+						}
+					}
+				}
+
+				// Process any remaining bytes
+				if (inNumber && tempIndex > 0) {
+					byteVal = (unsigned char)strtoul(tempHexByte, NULL, 16);
+					bytesToWrite.push_back(byteVal);
+				}
+
+				printf("\n");
+
+				// Validate and send the write request
+				if (!bytesToWrite.empty()) {
+					size_t dataSize = bytesToWrite.size();
+
+					// Check if write would exceed page boundary
+					if (pageOffset + dataSize > 4096) {
+						printf("[-] Warning: Write would exceed page boundary!\n");
+						dataSize = 4096 - pageOffset; // Limit to available bytes
+						printf("[!] Truncating write size to %zu bytes\n", dataSize);
+					}
+
+					// Check if write exceeds buffer size
+					if (dataSize > MAX_WRITE_BUFFER_SIZE) {
+						printf("[-] Warning: Data size exceeds buffer limit!\n");
+						dataSize = MAX_WRITE_BUFFER_SIZE;
+						printf("[!] Truncating write size to %zu bytes\n", dataSize);
+					}
+
+					// Prepare the write request
+					PWRITE_PHYS_REQUEST writeRequest = (PWRITE_PHYS_REQUEST)WritePhysArray;
+
+					// Clear the structure
+					memset(writeRequest, 0, sizeof(WRITE_PHYS_REQUEST));
+
+					// Fill the request structure
+					memcpy(writeRequest->identifier, "WPHY", 4);
+					writeRequest->targetVirtualAddress = (unsigned long long)virtualAddr * 0x1000;
+					writeRequest->offsetInPage = pageOffset;
+					writeRequest->dataSize = (ULONG)dataSize;
+
+					// Copy the data
+					for (size_t i = 0; i < dataSize; i++) {
+						writeRequest->data[i] = bytesToWrite[i];
+					}
+
+					writeRequest->isValid = TRUE;
+
+					// Display the write operation summary
+					printf("\n[+] Write Request Summary:\n");
+					printf("    Target Process: %s\n", targetProcess);
+					printf("    Virtual Address: 0x%p\n", writeRequest->targetVirtualAddress);
+					printf("    Page Offset: 0x%X\n", writeRequest->offsetInPage);
+					printf("    Data Size: %lu bytes\n", writeRequest->dataSize);
+					printf("    Final Target Address: 0x%p\n", (PBYTE)writeRequest->targetVirtualAddress + writeRequest->offsetInPage);
+					printf("    Data: ");
+					for (ULONG i = 0; i < writeRequest->dataSize; i++) {
+						printf("%02X ", writeRequest->data[i]);
+					}
+					printf("\n");
+					printf("    Note: Kernel will translate VA->PA automatically\n");
+
+					// Send the event to trigger the write
+					if (SetEvent(hEventWRITE_PHYS)) {
+						printf("[+] Write request sent to kernel driver\n");
+						printf("[*] Check kernel debug output for write status\n");
+					} else {
+						printf("[-] Failed to signal write event: %d\n", GetLastError());
+					}
+				} else {
+					printf("[-] No valid byte values entered\n");
+				}
+				break;
+			}
+			case 'r':
+			case 'R': {
+				// Read physical memory from target VPN functionality
+				printf("[*] Read Physical Memory from Target VPN\n");
+				printf("This function reads the physical memory page that the current target VPN maps to.\n");
+				printf("It will display the full 4KB page content.\n\n");
+
+				// Check if we have a valid target VPN
+				if (targetVPN == 0) {
+					printf("[-] No target VPN set. Please use 'U' command to set a target VPN first.\n");
+					break;
+				}
+
+				// Check if we have a valid target process
+				if (targetProcess == NULL || strlen(targetProcess) == 0) {
+					printf("[-] No target process set. Please use 'O' command to set a target process first.\n");
+					break;
+				}
+
+				printf("[+] Using current target VPN: 0x%llx\n", targetVPN);
+				printf("[+] Using current target process: %s\n", targetProcess);
+
+				// Calculate the virtual address from VPN
+				PVOID targetVA = (PVOID)(targetVPN * 0x1000);
+
+				// Prepare the read request
+				PREAD_PHYS_REQUEST readRequest = (PREAD_PHYS_REQUEST)ReadPhysArray;
+
+				// Clear the structure
+				memset(readRequest, 0, sizeof(READ_PHYS_REQUEST));
+
+				// Fill the request structure
+				memcpy(readRequest->identifier, "RPHY", 4);
+				readRequest->targetVirtualAddress = targetVA;
+				readRequest->isValid = TRUE;
+
+				printf("[+] Read Request Summary:\n");
+				printf("    Target Virtual Address: 0x%p\n", readRequest->targetVirtualAddress);
+				printf("    Target VPN: 0x%llx\n", targetVPN);
+				printf("    Target Process: %s\n", targetProcess);
+
+				// Send the event to trigger the read
+				if (SetEvent(hEventREAD_PHYS)) {
+					printf("[+] Read request sent to kernel driver\n");
+					printf("[*] Waiting for kernel to process the request...\n");
+					
+					// Wait a moment for the driver to process the request
+					Sleep(1000);
+
+					// Check if the request was processed (identifier should be cleared)
+					if (readRequest->identifier[0] == 0) {
+						printf("[+] Read operation completed successfully!\n");
+						printf("[+] Displaying 4KB physical page content:\n\n");
+
+						// Display the full 4KB page content in hex dump format
+						const unsigned char* pageData = readRequest->pageData;
+						
+						for (size_t i = 0; i < MAX_READ_BUFFER_SIZE; i += 16) {
+							printf("%04zX  ", i);   // Print offset
+
+							// Print hex bytes
+							for (size_t j = 0; j < 16 && i + j < MAX_READ_BUFFER_SIZE; j++) {
+								printf("%02X ", pageData[i + j]);
+							}
+
+							// Padding for alignment if less than 16 bytes
+							for (size_t j = 16; j > (MAX_READ_BUFFER_SIZE - i) && (MAX_READ_BUFFER_SIZE - i) < 16; j--) {
+								printf("   ");
+							}
+
+							printf(" | ");  // Separator
+
+							// Print ASCII representation
+							for (size_t j = 0; j < 16 && i + j < MAX_READ_BUFFER_SIZE; j++) {
+								unsigned char c = pageData[i + j];
+								printf("%c", (c >= 32 && c <= 126) ? c : '.');  // Printable ASCII or dot
+							}
+
+							printf(" |\n");
+						}
+
+						printf("\n[+] Read operation completed. Displayed %d bytes.\n", MAX_READ_BUFFER_SIZE);
+					} else {
+						printf("[-] Read operation may have failed or is still processing.\n");
+						printf("[-] Check kernel debug output for details.\n");
+					}
+				} else {
+					printf("[-] Failed to signal read event: %d\n", GetLastError());
+				}
+				break;
+			}
 			default:
 				printf("Unknown command '%c'. Try:\n", ch);
 				ShowHelp();
@@ -1865,5 +2375,28 @@ cleanup:
 	else {
 		printf("[-] Failed to set event: %d\n", GetLastError());
 	}
+
+	// Cleanup WritePhysical resources
+	if (WritePhysArray) {
+		UnmapViewOfFile(WritePhysArray);
+	}
+	if (hWritePhysMapFile) {
+		CloseHandle(hWritePhysMapFile);
+	}
+	if (hEventWRITE_PHYS) {
+		CloseHandle(hEventWRITE_PHYS);
+	}
+
+	// Cleanup ReadPhysical resources
+	if (ReadPhysArray) {
+		UnmapViewOfFile(ReadPhysArray);
+	}
+	if (hReadPhysMapFile) {
+		CloseHandle(hReadPhysMapFile);
+	}
+	if (hEventREAD_PHYS) {
+		CloseHandle(hEventREAD_PHYS);
+	}
+
 	return 0;
 }
