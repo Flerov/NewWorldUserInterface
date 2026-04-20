@@ -69,7 +69,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		UNICODE_STRING sectionName;
 		PVOID sectionObject = NULL;
 		LARGE_INTEGER sectionSize;
-		sectionSize.QuadPart = 0x4000; // or whatever size you want, 4KB * 4 in this case
+		sectionSize.QuadPart = 0x40000; // 256 KB — supports ~3200 VAD nodes
 		SECURITY_DESCRIPTOR sdSecurityDescriptor;
 		ACL sdAcl;
 		RtlCreateSecurityDescriptor(&sdSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION);
@@ -114,7 +114,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		UNICODE_STRING sectionFileName;
 		PVOID sectionFileNameObject = NULL;
 		LARGE_INTEGER sectionSizeFILENAMES;
-		sectionSizeFILENAMES.QuadPart = 0x4000; // or whatever size you want, 4KB in this case
+		sectionSizeFILENAMES.QuadPart = 0x10000; // 64 KB — supports ~800 named VAD entries
 
 		DbgPrint("[+] Initializing Section Name for FileName\n");
 		RtlInitUnicodeString(&sectionFileName, MAPPING_NAME_FROM_FILENAMES);
@@ -246,11 +246,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		// MAPPING_NOTIFICATION_USERMODEREADY_EVENT START
 		UNICODE_STRING eventNameUSERMODEREADY;
 		OBJECT_ATTRIBUTES objAttrUSERMODEREADY;
-		HANDLE hThreadUSERMODEREADY;
-		PKEVENT pEventUSERMODEREADY;
 		RtlInitUnicodeString(&eventNameUSERMODEREADY, MAPPING_NOTIFICATION_USERMODEREADY_EVENT);
 		InitializeObjectAttributes(&objAttrUSERMODEREADY, &eventNameUSERMODEREADY, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
-		status = ZwCreateEvent(&hEventUSERMODEREADY, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUSERMODEREADY, NotificationEvent, FALSE);
+		status = ZwCreateEvent(&hEventUSERMODEREADY, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUSERMODEREADY, SynchronizationEvent, FALSE);
 		if (NT_SUCCESS(status)) {
 			DbgPrint("[+] Opened event handle: %llx\n", hEventUSERMODEREADY);
 			ObReferenceObjectByHandle(hEventUSERMODEREADY, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventUSERMODEREADY, NULL);
@@ -270,8 +268,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		// MAPPING_NOTIFICATION_Unlink_EVENT START
 		UNICODE_STRING eventNameUnlink;
 		OBJECT_ATTRIBUTES objAttrUnlink;
-		HANDLE hThreadUnlink;
-		PKEVENT pEventUnlink;
 		RtlInitUnicodeString(&eventNameUnlink, MAPPING_NOTIFICATION_Unlink_EVENT);
 		InitializeObjectAttributes(&objAttrUnlink, &eventNameUnlink, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
 		status = ZwCreateEvent(&hEventUnlink, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrUnlink, NotificationEvent, FALSE);
@@ -296,8 +292,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		// MAPPING_NOTIFICATION_LINK_EVENT START
 		UNICODE_STRING eventNameLINK;
 		OBJECT_ATTRIBUTES objAttrLINK;
-		HANDLE hThreadLINK;
-		PKEVENT pEventLINK;
 		RtlInitUnicodeString(&eventNameLINK, MAPPING_NOTIFICATION_LINK_EVENT);
 		InitializeObjectAttributes(&objAttrLINK, &eventNameLINK, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
 		status = ZwCreateEvent(&hEventLINK, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrLINK, NotificationEvent, FALSE);
@@ -323,8 +317,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		// MAPPING_NOTIFICATION_INIT_EVENT START
 		UNICODE_STRING eventNameINIT;
 		OBJECT_ATTRIBUTES objAttrINIT;
-		HANDLE hThreadINIT;
-		PKEVENT pEventINIT;
 		RtlInitUnicodeString(&eventNameINIT, MAPPING_NOTIFICATION_INIT_EVENT);
 		InitializeObjectAttributes(&objAttrINIT, &eventNameINIT, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
 		status = ZwCreateEvent(&hEventINIT, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrINIT, NotificationEvent, FALSE);
@@ -348,8 +340,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		// MAPPING_NOTIFICATION_WRITE_PHYS_EVENT START
 		UNICODE_STRING eventNameWRITE_PHYS;
 		OBJECT_ATTRIBUTES objAttrWRITE_PHYS;
-		HANDLE hThreadWRITE_PHYS;
-		PKEVENT pEventWRITE_PHYS;
 		RtlInitUnicodeString(&eventNameWRITE_PHYS, MAPPING_NOTIFICATION_WRITE_PHYS_EVENT);
 		InitializeObjectAttributes(&objAttrWRITE_PHYS, &eventNameWRITE_PHYS, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
 		status = ZwCreateEvent(&hEventWRITE_PHYS, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrWRITE_PHYS, NotificationEvent, FALSE);
@@ -378,8 +368,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 		// MAPPING_NOTIFICATION_READ_PHYS_EVENT START
 		UNICODE_STRING eventNameREAD_PHYS;
 		OBJECT_ATTRIBUTES objAttrREAD_PHYS;
-		HANDLE hThreadREAD_PHYS;
-		PKEVENT pEventREAD_PHYS;
 		RtlInitUnicodeString(&eventNameREAD_PHYS, MAPPING_NOTIFICATION_READ_PHYS_EVENT);
 		InitializeObjectAttributes(&objAttrREAD_PHYS, &eventNameREAD_PHYS, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
 		status = ZwCreateEvent(&hEventREAD_PHYS, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrREAD_PHYS, NotificationEvent, FALSE);
@@ -407,6 +395,113 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 			return status;
 		}
 		// MAPPING_NOTIFICATION_READ_PHYS_EVENT END
+		// -----------------------------------------------------------------
+		// VAD MODIFY SECTION + EVENTS START
+		OBJECT_ATTRIBUTES attrVadModify;
+		UNICODE_STRING sectionVadModify;
+		LARGE_INTEGER sectionSizeVadModify;
+		sectionSizeVadModify.QuadPart = sizeof(VAD_MODIFY_REQUEST);
+		RtlInitUnicodeString(&sectionVadModify, MAPPING_NAME_VAD_MODIFY);
+		InitializeObjectAttributes(&attrVadModify, &sectionVadModify, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
+		status = ZwCreateSection(&hVadModifySection, SECTION_ALL_ACCESS | SECTION_MAP_WRITE,
+			&attrVadModify, &sectionSizeVadModify, PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
+		if (!NT_SUCCESS(status) || hVadModifySection == NULL) {
+			DbgPrint("[-] Failed to create VAD modify section: %08X\n", status);
+			ZwClose(hReadPhysSection);
+			ZwClose(hWritePhysSection);
+			ZwClose(gpDeviceContext->hSection);
+			ZwClose(gpDeviceContext->hSectionFileName);
+			ZwClose(hEventUSERMODEREADY);
+			ZwClose(hEventUnlink);
+			ZwClose(hEventLINK);
+			ZwClose(hEventINIT);
+			ZwClose(hEventWRITE_PHYS);
+			ZwClose(hEventREAD_PHYS);
+			IoDeleteSymbolicLink(&usSymbolicLinkName);
+			IoDeleteDevice(gpDeviceObject);
+			return status;
+		}
+		gVadModifyViewSize = 0;
+		LARGE_INTEGER SectionVadModifyOffset = { 0 };
+		status = ZwMapViewOfSection(hVadModifySection, ZwCurrentProcess(), &gVadModifySection,
+			0, 0, NULL, &gVadModifyViewSize, ViewShare, 0, PAGE_READWRITE);
+		if (!NT_SUCCESS(status)) {
+			DbgPrint("[-] Failed to map VAD modify section: %08X\n", status);
+			ZwClose(hVadModifySection);
+			ZwClose(hReadPhysSection);
+			ZwClose(hWritePhysSection);
+			ZwClose(gpDeviceContext->hSection);
+			ZwClose(gpDeviceContext->hSectionFileName);
+			ZwClose(hEventUSERMODEREADY);
+			ZwClose(hEventUnlink);
+			ZwClose(hEventLINK);
+			ZwClose(hEventINIT);
+			ZwClose(hEventWRITE_PHYS);
+			ZwClose(hEventREAD_PHYS);
+			IoDeleteSymbolicLink(&usSymbolicLinkName);
+			IoDeleteDevice(gpDeviceObject);
+			return status;
+		}
+		RtlZeroMemory(gVadModifySection, gVadModifyViewSize);
+		DbgPrint("[+] VAD modify section mapped: base 0x%p size %zu\n", gVadModifySection, gVadModifyViewSize);
+
+		UNICODE_STRING eventNameVAD_INSERT;
+		OBJECT_ATTRIBUTES objAttrVAD_INSERT;
+		RtlInitUnicodeString(&eventNameVAD_INSERT, MAPPING_NOTIFICATION_VAD_INSERT_EVENT);
+		InitializeObjectAttributes(&objAttrVAD_INSERT, &eventNameVAD_INSERT, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
+		status = ZwCreateEvent(&hEventVAD_INSERT, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrVAD_INSERT, NotificationEvent, FALSE);
+		if (NT_SUCCESS(status)) {
+			DbgPrint("[+] VAD insert event handle: %p\n", hEventVAD_INSERT);
+			ObReferenceObjectByHandle(hEventVAD_INSERT, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventVAD_INSERT, NULL);
+			PsCreateSystemThread(&hThreadVAD_INSERT, THREAD_ALL_ACCESS, NULL, NULL, NULL, VadInsertWorkerThread, pEventVAD_INSERT);
+		}
+		else {
+			DbgPrint("[-] Failed to create VAD insert event: %08X\n", status);
+			ZwClose(hVadModifySection);
+			ZwClose(hReadPhysSection);
+			ZwClose(hWritePhysSection);
+			ZwClose(gpDeviceContext->hSection);
+			ZwClose(gpDeviceContext->hSectionFileName);
+			ZwClose(hEventUSERMODEREADY);
+			ZwClose(hEventUnlink);
+			ZwClose(hEventLINK);
+			ZwClose(hEventINIT);
+			ZwClose(hEventWRITE_PHYS);
+			ZwClose(hEventREAD_PHYS);
+			IoDeleteSymbolicLink(&usSymbolicLinkName);
+			IoDeleteDevice(gpDeviceObject);
+			return status;
+		}
+
+		UNICODE_STRING eventNameVAD_REMOVE;
+		OBJECT_ATTRIBUTES objAttrVAD_REMOVE;
+		RtlInitUnicodeString(&eventNameVAD_REMOVE, MAPPING_NOTIFICATION_VAD_REMOVE_EVENT);
+		InitializeObjectAttributes(&objAttrVAD_REMOVE, &eventNameVAD_REMOVE, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, &sdSecurityDescriptor);
+		status = ZwCreateEvent(&hEventVAD_REMOVE, EVENT_ALL_ACCESS | SYNCHRONIZE, &objAttrVAD_REMOVE, NotificationEvent, FALSE);
+		if (NT_SUCCESS(status)) {
+			DbgPrint("[+] VAD remove event handle: %p\n", hEventVAD_REMOVE);
+			ObReferenceObjectByHandle(hEventVAD_REMOVE, EVENT_ALL_ACCESS, *ExEventObjectType, KernelMode, (PVOID*)&pEventVAD_REMOVE, NULL);
+			PsCreateSystemThread(&hThreadVAD_REMOVE, THREAD_ALL_ACCESS, NULL, NULL, NULL, VadRemoveWorkerThread, pEventVAD_REMOVE);
+		}
+		else {
+			DbgPrint("[-] Failed to create VAD remove event: %08X\n", status);
+			ZwClose(hEventVAD_INSERT);
+			ZwClose(hVadModifySection);
+			ZwClose(hReadPhysSection);
+			ZwClose(hWritePhysSection);
+			ZwClose(gpDeviceContext->hSection);
+			ZwClose(gpDeviceContext->hSectionFileName);
+			ZwClose(hEventUSERMODEREADY);
+			ZwClose(hEventUnlink);
+			ZwClose(hEventLINK);
+			ZwClose(hEventINIT);
+			ZwClose(hEventWRITE_PHYS);
+			ZwClose(hEventREAD_PHYS);
+			IoDeleteSymbolicLink(&usSymbolicLinkName);
+			IoDeleteDevice(gpDeviceObject);
+			return status;
+		}
+		// VAD MODIFY SECTION + EVENTS END
 		// -----------------------------------------------------------------
 		status = STATUS_SUCCESS;
 		return status;

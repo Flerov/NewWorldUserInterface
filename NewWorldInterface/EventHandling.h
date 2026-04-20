@@ -31,6 +31,8 @@ VOID UserModeReadWorkerThread(PVOID Context);
 VOID INITWorkerThread(PVOID Context);
 VOID WritePhysicalWorkerThread(PVOID Context);
 VOID ReadPhysicalWorkerThread(PVOID Context);
+VOID VadInsertWorkerThread(PVOID Context);   // insert a new MMVAD node into target process
+VOID VadRemoveWorkerThread(PVOID Context);   // remove an existing MMVAD node from target process
 
 // Extract event creation/management from DriverEntry
 NTSTATUS CreateEventHandlers(void);

@@ -11,6 +11,9 @@
 #define MAPPING_NOTIFICATION_USERMODEREADY_EVENT L"\\BaseNamedObjects\\Global\\UserModeReadEvent"
 #define MAPPING_NOTIFICATION_WRITE_PHYS_EVENT L"\\BaseNamedObjects\\Global\\WritePhysicalMemoryEvent"
 #define MAPPING_NOTIFICATION_READ_PHYS_EVENT L"\\BaseNamedObjects\\Global\\ReadPhysicalMemoryEvent"
+#define MAPPING_NAME_VAD_MODIFY              L"\\BaseNamedObjects\\VADModifyRequest"
+#define MAPPING_NOTIFICATION_VAD_INSERT_EVENT L"\\BaseNamedObjects\\Global\\VADInsertEvent"
+#define MAPPING_NOTIFICATION_VAD_REMOVE_EVENT L"\\BaseNamedObjects\\Global\\VADRemoveEvent"
 
 #define MAX_FILENAME_SIZE 80
 #define MAX_WRITE_BUFFER_SIZE 4096

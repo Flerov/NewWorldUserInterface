@@ -9,7 +9,9 @@ PEPROCESS GetProcessByName(
 	PVOID StartProc = CurrEProc;
 	PLIST_ENTRY CurList = (PLIST_ENTRY)((ULONG_PTR)CurrEProc + eprocActiveProcessLinks);
 	PCHAR CurrentImageName = (PCHAR)((ULONG_PTR)CurrEProc + eprocImageFileNameOffset);
-	size_t FileNameSize = (strlen(FileName) > 15) ? 14 : strlen(FileName); // 14 cause of null terminator
+	// EPROCESS.ImageFileName is 15 bytes: up to 14 chars + null terminator.
+	// Clamp compare length to 14 so we never read past the stored name.
+	size_t FileNameSize = (strlen(FileName) > 14) ? 14 : strlen(FileName);
 	do {
 		if (!MmIsAddressValid(CurrEProc)) {
 			DbgPrint("[-] Invalid EPROCESS address: 0x%llx\n", CurrEProc);

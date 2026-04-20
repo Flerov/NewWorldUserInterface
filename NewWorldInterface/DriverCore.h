@@ -68,3 +68,29 @@ extern HANDLE hEventREAD_PHYS;
 extern PVOID gReadPhysSection;
 extern SIZE_T gReadPhysViewSize;
 extern HANDLE hReadPhysSection;
+// VAD tree modification
+extern HANDLE hEventVAD_INSERT;
+extern HANDLE hEventVAD_REMOVE;
+extern HANDLE hVadModifySection;
+extern PVOID  gVadModifySection;
+extern SIZE_T  gVadModifyViewSize;
+
+// Thread handles — saved globally so DriverUnload can wait for each thread to exit
+extern HANDLE hThreadUSERMODEREADY;
+extern HANDLE hThreadUnlink;
+extern HANDLE hThreadLINK;
+extern HANDLE hThreadINIT;
+extern HANDLE hThreadWRITE_PHYS;
+extern HANDLE hThreadREAD_PHYS;
+extern HANDLE hThreadVAD_INSERT;
+extern HANDLE hThreadVAD_REMOVE;
+
+// KEVENT object pointers — used to signal threads on shutdown and to release references
+extern PKEVENT pEventUSERMODEREADY;
+extern PKEVENT pEventUnlink;
+extern PKEVENT pEventLINK;
+extern PKEVENT pEventINIT;
+extern PKEVENT pEventWRITE_PHYS;
+extern PKEVENT pEventREAD_PHYS;
+extern PKEVENT pEventVAD_INSERT;
+extern PKEVENT pEventVAD_REMOVE;

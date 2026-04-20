@@ -31,7 +31,7 @@ VOID LinkWorkerThread(PVOID Context) {
 		// check if gInit.sourceProcess and gInit.targetProcess contains data or is filled with null-bytes
 		if (gInit.sourceProcess[0] == '\0' || gInit.targetProcess[0] == '\0') {
 			DbgPrint("[-] LinkWorkerThread: sourceProcess or targetProcess is invalid (empty)\n");
-			break;
+			continue; // keep thread alive
 		}
 
 		gSourceProcess = GetProcessByName(gInit.sourceProcess, gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
@@ -49,7 +49,7 @@ VOID LinkWorkerThread(PVOID Context) {
 		}
 		else {
 			DbgPrint("[-] LinkWorkerThread: targetVPN is invalid (0x0)\n");
-			break;
+			continue; // keep thread alive
 		}
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
@@ -64,21 +64,26 @@ VOID UnlinkWorkerThread(PVOID Context) {
 			break;
 		}
 		if (gOrigVal != 0x0 && gOrigPhys.QuadPart != 0x0 && gSourceProcess != NULL) {
-			PKAPC_STATE ApcState;
+			KAPC_STATE ApcState; // must be KAPC_STATE (the struct), NOT PKAPC_STATE (a pointer)
 			KeStackAttachProcess(gSourceProcess, &ApcState);
-			PVOID* temp = MmGetVirtualForPhysical(gOrigPhys);
-			memcpy(temp, &gOrigVal, sizeof(gOrigVal));
-			unsigned long long curVal = *temp;
-			if (curVal != 0x0) {
-				if (curVal == gOrigVal) {
-					DbgPrint("[+] Successfully restored all modified PTEs to their original values\n");
+			PVOID temp = MmGetVirtualForPhysical(gOrigPhys);
+			if (temp != NULL) {
+				memcpy(temp, &gOrigVal, sizeof(gOrigVal));
+				unsigned long long curVal = *(unsigned long long*)temp;
+				if (curVal != 0x0) {
+					if (curVal == gOrigVal) {
+						DbgPrint("[+] Successfully restored all modified PTEs to their original values\n");
+					}
+					else {
+						DbgPrint("[-] Failed to restore modified PTEs\n");
+					}
 				}
 				else {
-					DbgPrint("[-] Failed to restore modified PTEs\n");
+					DbgPrint("[-] MmGetVirtualForPhysical has no content\n");
 				}
-			}
-			else {
-				DbgPrint("[-] MmGetVirtualForPhysical has no content\n");
+			} else {
+				DbgPrint("[-] MmGetVirtualForPhysical returned NULL for phys=0x%llx\n",
+					gOrigPhys.QuadPart);
 			}
 			KeUnstackDetachProcess(&ApcState);
 		}
@@ -86,49 +91,69 @@ VOID UnlinkWorkerThread(PVOID Context) {
 			DbgPrint("[-] No modified PTEs to restore\n");
 		}
 
-		ZwClose(hEventLINK);
-		ZwClose(hEventUnlink);
-		ZwClose(hEventINIT);
-		ZwClose(hEventUSERMODEREADY);
-		ZwClose(hEventWRITE_PHYS);
-		ZwClose(hEventREAD_PHYS);
+		// -------------------------------------------------------
+		// Session reset — DO NOT close any kernel handles.
+		// All named sections and events must remain open so a
+		// restarted usermode can call OpenFileMappingW /
+		// OpenEventW and reconnect without reloading the driver.
+		// -------------------------------------------------------
 
-		ZwUnmapViewOfSection(ZwCurrentProcess(), hInSection);
-		ZwClose(hInSection);
+		// Unmap the symbol-input view so INITWorkerThread remaps
+		// it (and re-reads offsets) when the next INIT fires.
+		if (pInSection != NULL) {
+			ZwUnmapViewOfSection(ZwCurrentProcess(), pInSection);
+			pInSection = NULL;
+		}
 
-		DbgPrint("[+] Freeing space...\n");
-		ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSection);
-		ZwClose(gpDeviceContext->hSection);
+		// Reset per-session state
+		gSourceProcess      = NULL;
+		gOrigVal            = 0x0;
+		gOrigPhys.QuadPart  = 0;
+		gSecVADIndex        = 0;
+		gCurrFileNameOffset = 1;
 
-		DbgPrint("[+] Freeing space for FileName...\n");
-		ZwUnmapViewOfSection(ZwCurrentProcess(), gpDeviceContext->hSectionFileName);
-		ZwClose(gpDeviceContext->hSectionFileName);
+		// Zero output buffers so stale data isn't shown on reconnect
+		if (gSection)          RtlZeroMemory(gSection,          gViewSize);
+		if (gFileNameSection)  RtlZeroMemory(gFileNameSection,  gFileNameViewSize);
+		if (gVadModifySection) RtlZeroMemory(gVadModifySection, sizeof(VAD_MODIFY_REQUEST));
 
-		DbgPrint("[+] Freeing space for WritePhysical...\n");
-		ZwUnmapViewOfSection(ZwCurrentProcess(), &gWritePhysSection);
-		ZwClose(hWritePhysSection);
+		// Zero INIT / symbol structs — will be repopulated on next INIT signal
+		RtlZeroMemory(&gInit,    sizeof(gInit));
+		RtlZeroMemory(&gSymInfo, sizeof(gSymInfo));
 
-		DbgPrint("[+] Freeing space for ReadPhysical...\n");
-		ZwUnmapViewOfSection(ZwCurrentProcess(), gReadPhysSection);
-		ZwClose(hReadPhysSection);
+		DbgPrint("[+] UnlinkWorkerThread: session reset complete — driver ready for reconnect\n");
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 VOID UserModeReadWorkerThread(PVOID Context) {
-	g_StopRequested = FALSE;
+	// g_StopRequested is initialised to FALSE in DriverCore.c; do NOT reset it here —
+	// DriverUnload may have already set it TRUE before this thread is scheduled.
 	PKEVENT pEvent = (PKEVENT)Context;
 	while (!g_StopRequested) {
-		pEvent->Header.SignalState = 0; // Reset the event
-		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL); // TODO: perhaps change to WaitForMultipleObjects
+		// SynchronizationEvent: KeWaitForSingleObject atomically resets the event on wake.
+		// Do NOT manually clear SignalState — that would discard any signal that arrived
+		// while WalkVAD was running, causing subsequent '1' presses to appear to do nothing.
+		NTSTATUS status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
 		if (!NT_SUCCESS(status)) {
 			DbgPrint("[-] UserModeReadWorkerThread Failed to wait for event: %08X\n", status);
 			break;
 		}
 
-		// check if gInit.sourceProcess and gInit.targetProcess contains data or is filled with null-bytes
-		if (gInit.targetProcess[0] == '\0') {
-			DbgPrint("[-] UserModeReadWorkerThread: targetProcess is invalid (empty)\n");
-			break;
+		// Read walkMode directly from the live input section so a new mode written by '1'
+		// is immediately honoured without requiring a new INIT event.
+		UCHAR liveWalkMode = (pInSection != NULL) ? ((PINIT)pInSection)->walkMode : 0;
+
+		// Verify the process required by the requested walk mode is configured
+		if (liveWalkMode == 1) {
+			if (gInit.sourceProcess[0] == '\0') {
+				DbgPrint("[-] UserModeReadWorkerThread: sourceProcess not set (mode=source) — waiting\n");
+				continue;
+			}
+		} else {
+			if (gInit.targetProcess[0] == '\0') {
+				DbgPrint("[-] UserModeReadWorkerThread: targetProcess not set — waiting\n");
+				continue;
+			}
 		}
 
 		// Make sure section is not getting paged-out | VAD Node Info - Memory Section
@@ -142,11 +167,50 @@ VOID UserModeReadWorkerThread(PVOID Context) {
 
 		RtlZeroMemory(gFileNameSection, gFileNameViewSize);
 		RtlZeroMemory(gSection, gViewSize);
-		if (pTargetProcess != NULL) {
-			WalkVAD(pTargetProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
-				gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
-				gSymInfo.MMVADCAFilePointer, gSymInfo.FILEOBJECTFileName, 0x0);
-		}
+		gSecVADIndex        = 0;
+		gCurrFileNameOffset = 1;
+
+		if (liveWalkMode == 1) {
+				// Source process only
+				if (gSourceProcess) {
+					WalkVAD(gSourceProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
+						gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
+						gSymInfo.MMVADCAFilePointer, gSymInfo.MMCAFlags, gSymInfo.FILEOBJECTFileName, 0x0);
+					DbgPrint("[+] UserModeReadWorkerThread: source walk done, %zu entries\n", gSecVADIndex);
+				}
+			} else if (liveWalkMode == 2) {
+				// Target first
+				if (pTargetProcess) {
+					WalkVAD(pTargetProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
+						gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
+						gSymInfo.MMVADCAFilePointer, gSymInfo.MMCAFlags, gSymInfo.FILEOBJECTFileName, 0x0);
+					DbgPrint("[+] UserModeReadWorkerThread: target walk done, %zu entries\n", gSecVADIndex);
+				}
+				// Sentinel: Level=-1, magic StartingVpn marks the boundary
+				size_t maxSlots = gViewSize / sizeof(VAD_NODE);
+				if (gSecVADIndex < maxSlots - 1) {
+					PVAD_NODE sent = (PVAD_NODE)gSection + gSecVADIndex;
+					RtlZeroMemory(sent, sizeof(VAD_NODE));
+					sent->Level       = -1;
+					sent->StartingVpn = 0xFFFFFFFFFFFFFFFEULL;
+					gSecVADIndex++;
+				}
+				// Source second
+				if (gSourceProcess) {
+					WalkVAD(gSourceProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
+						gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
+						gSymInfo.MMVADCAFilePointer, gSymInfo.MMCAFlags, gSymInfo.FILEOBJECTFileName, 0x0);
+					DbgPrint("[+] UserModeReadWorkerThread: source walk done, %zu total entries\n", gSecVADIndex);
+				}
+			} else {
+				// Target only (mode 0, default)
+				if (pTargetProcess) {
+					WalkVAD(pTargetProcess, gSymInfo.VADRoot, gSymInfo.StartingVpnOffset, gSymInfo.EndingVpnOffset,
+						gSymInfo.Left, gSymInfo.Right, gSymInfo.MMVADSubsection, gSymInfo.MMVADControlArea,
+						gSymInfo.MMVADCAFilePointer, gSymInfo.MMCAFlags, gSymInfo.FILEOBJECTFileName, 0x0);
+					DbgPrint("[+] UserModeReadWorkerThread: target walk done, %zu entries\n", gSecVADIndex);
+				}
+			}
 	}
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -592,6 +656,393 @@ VOID ReadPhysicalWorkerThread(PVOID Context) {
 
         // Mark request as processed
         readRequest->isValid = FALSE;
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+// =================================================================
+// VadInsertWorkerThread
+// Waits for hEventVAD_INSERT. Reads a VAD_MODIFY_REQUEST with
+// identifier "VINS", allocates a minimal MMVAD-compatible node,
+// fills the VPN range and flags, then calls VadTreeInsert.
+// Result NTSTATUS is written back to the request before isValid=FALSE.
+// =================================================================
+VOID VadInsertWorkerThread(PVOID Context) {
+    PKEVENT          pEvent = (PKEVENT)Context;
+    PVAD_MODIFY_REQUEST req;
+    PEPROCESS        pTarget;
+    PVOID            newNode;
+    NTSTATUS         status;
+    SIZE_T           nodeSize;
+    unsigned long long qw;
+    unsigned long long high;
+    UCHAR            liveWalkMode;
+    const char*      procName;
+
+    while (!g_StopRequested) {
+        pEvent->Header.SignalState = 0;
+        status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("[-] VadInsertWorkerThread: wait failed %08X\n", status);
+            break;
+        }
+
+        if (!gVadModifySection) {
+            DbgPrint("[-] VadInsertWorkerThread: gVadModifySection is NULL\n");
+            continue;
+        }
+
+        req = (PVAD_MODIFY_REQUEST)gVadModifySection;
+
+        if (!req->isValid) {
+            DbgPrint("[-] VadInsertWorkerThread: isValid=FALSE, skipping\n");
+            continue;
+        }
+
+        // ── QHNT: query VadFreeHint → return the suggested next-free StartingVpn ──
+        if (memcmp(req->identifier, "QHNT", 4) == 0) {
+            // Walk the same tree that was last populated: source for mode=1, target for mode=0/2
+            liveWalkMode = (pInSection != NULL) ? ((PINIT)pInSection)->walkMode : 0;
+            procName     = (liveWalkMode == 1) ? gInit.sourceProcess : gInit.targetProcess;
+            PEPROCESS pQ = GetProcessByName(procName,
+                gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
+            if (!pQ) {
+                DbgPrint("[-] QHNT: process '%s' not found\n", procName);
+                req->Result  = STATUS_NOT_FOUND;
+                req->isValid = FALSE;
+                continue;
+            }
+
+            // The MMVAD stores only 40 bits of VPN (32-bit low + 8-bit high).
+            // A user-mode process VAD tree has NO kernel-space nodes, so we can't
+            // use the canonical hole as a split point.  Instead divide the 40-bit
+            // VPN space in half:
+            //   low  (≤ 0x3FFFFFFFF): private heap/stack/data allocations
+            //   high (> 0x3FFFFFFFF): system DLL / high-VA area (0x7FF... range)
+            // This naturally separates the two allocation zones in any user process.
+            // For a kernel process walk, actual kernel VPNs (0xFFxx_xxxxxxxx after
+            // 40-bit truncation) are >> 0x3FFFFFFFF and land in the high bucket too.
+            #define USER_MAX_VPN   0x7FFFFFFFFull
+            #define KERNEL_MIN_VPN 0x400000000ull  // upper half of 40-bit VPN space
+
+            // Full in-order BST walk: track the maximum EndingVpn seen in each
+            // address space independently.  Single pass, explicit stack.
+            {
+                PVOID* pVadRoot = (PVOID*)((ULONG_PTR)pQ + gSymInfo.VADRoot);
+                PVOID  vadRoot  = (pVadRoot && MmIsAddressValid(pVadRoot)) ? *pVadRoot : NULL;
+
+                unsigned long long maxUserEndVpn   = 0;
+                unsigned long long maxKernelEndVpn = 0;
+
+                #define QHNT_STACK_DEPTH 64
+                PVOID qstack[QHNT_STACK_DEPTH];
+                int   qtop = 0;
+                PVOID cur  = vadRoot;
+
+                while ((cur && MmIsAddressValid(cur)) || qtop > 0) {
+                    while (cur && MmIsAddressValid(cur)) {
+                        if (qtop < QHNT_STACK_DEPTH) qstack[qtop++] = cur;
+                        cur = *(PVOID*)((ULONG_PTR)cur + gSymInfo.Left);
+                    }
+                    if (qtop == 0) break;
+                    cur = qstack[--qtop];
+
+                    ULONG endLow  = *(ULONG*)((ULONG_PTR)cur + gSymInfo.EndingVpnOffset);
+                    UCHAR endHigh = *(UCHAR*)((ULONG_PTR)cur + gSymInfo.EndingVpnOffset + 5);
+                    unsigned long long endVpn = (unsigned long long)endLow | ((unsigned long long)endHigh << 32);
+
+                    if (endVpn >= KERNEL_MIN_VPN) {
+                        if (endVpn > maxKernelEndVpn) maxKernelEndVpn = endVpn;
+                    } else {
+                        if (endVpn > maxUserEndVpn) maxUserEndVpn = endVpn;
+                    }
+
+                    cur = *(PVOID*)((ULONG_PTR)cur + gSymInfo.Right);
+                }
+                #undef QHNT_STACK_DEPTH
+
+                // User suggestion
+                if (maxUserEndVpn > 0 && (maxUserEndVpn + 1) <= USER_MAX_VPN)
+                    req->SuggestedUserVpn = maxUserEndVpn + 1;
+                else
+                    req->SuggestedUserVpn = 0;
+
+                // Kernel suggestion
+                if (maxKernelEndVpn > 0) {
+                    unsigned long long ksugg = maxKernelEndVpn + 1;
+                    req->SuggestedKernelVpn = (ksugg >= KERNEL_MIN_VPN) ? ksugg : 0;
+                } else {
+                    req->SuggestedKernelVpn = 0;
+                }
+
+                DbgPrint("[+] QHNT: process='%s' userSugg=0x%llx kernelSugg=0x%llx\n",
+                    procName, req->SuggestedUserVpn, req->SuggestedKernelVpn);
+            }
+
+            req->Result  = STATUS_SUCCESS;
+            req->isValid = FALSE;
+            continue;
+        }
+
+        if (memcmp(req->identifier, "VINS", 4) != 0) {
+            DbgPrint("[-] VadInsertWorkerThread: unknown identifier, discarding\n");
+            req->Result  = STATUS_INVALID_PARAMETER;
+            req->isValid = FALSE;
+            continue;
+        }
+
+        // Insert into the same process whose tree was last walked
+        liveWalkMode = (pInSection != NULL) ? ((PINIT)pInSection)->walkMode : 0;
+        procName     = (liveWalkMode == 1) ? gInit.sourceProcess : gInit.targetProcess;
+        pTarget = GetProcessByName(procName,
+            gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
+        if (!pTarget) {
+            DbgPrint("[-] VadInsertWorkerThread: process '%s' not found\n", procName);
+            req->Result  = STATUS_NOT_FOUND;
+            req->isValid = FALSE;
+            continue;
+        }
+
+        // ── Step 1: allocate and initialise node ─────────────────────────
+        // Done before acquiring the lock because ExAllocatePool2 can block.
+        nodeSize = req->NodeSize ? req->NodeSize : 0x80;
+        newNode  = NULL;
+        status   = VadAllocateNode(nodeSize, &newNode);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("[-] VadInsertWorkerThread: VadAllocateNode failed %08X\n", status);
+            req->Result  = status;
+            req->isValid = FALSE;
+            continue;
+        }
+
+        // Encode StartingVpn / EndingVpn at StartingVpnOffset
+        qw   = (req->StartingVpn & 0xFFFFFFFF) | ((req->EndingVpn & 0xFFFFFFFF) << 32);
+        *(unsigned long long*)((ULONG_PTR)newNode + gSymInfo.StartingVpnOffset) = qw;
+        // High bytes at +0x20 (StartingVpnHigh[7:0] | EndingVpnHigh[7:0]<<8)
+        high = (req->StartingVpn >> 32) & 0xFF;
+        high |= ((req->EndingVpn >> 32) & 0xFF) << 8;
+        *(unsigned long long*)((ULONG_PTR)newNode + 0x20) = high;
+        // MMVAD_FLAGS at +0x30
+        *(ULONG*)((ULONG_PTR)newNode + 0x30) = req->VadTypeRaw;
+
+        // ── Step 2: commit charges ────────────────────────────────────────
+        // Mi* offsets are PDB RVAs — add NtBaseOffset to get the real VA.
+        // MiInsertVadCharges can block; must run outside the lock.
+        if (gSymInfo.MiInsertVadCharges) {
+            PFN_MiInsertVadCharges fnCharges =
+                (PFN_MiInsertVadCharges)(gInit.NtBaseOffset + gSymInfo.MiInsertVadCharges);
+            __try {
+                status = fnCharges(newNode, pTarget);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                status = GetExceptionCode();
+                DbgPrint("[-] VadInsertWorkerThread: MiInsertVadCharges raised exception %08X — rolling back\n", status);
+                VadFreeNode(newNode);
+                req->Result  = status;
+                req->isValid = FALSE;
+                continue;
+            }
+            if (!NT_SUCCESS(status)) {
+                DbgPrint("[-] VadInsertWorkerThread: MiInsertVadCharges failed %08X — rolling back\n", status);
+                VadFreeNode(newNode);
+                req->Result  = status;
+                req->isValid = FALSE;
+                continue;
+            }
+        }
+
+        // ── Step 3+4: conflict check + insert under exclusive lock ────────
+        {
+            PEX_PUSH_LOCK pLock =
+                (PEX_PUSH_LOCK)((ULONG_PTR)pTarget + gSymInfo.AddressCreationLock);
+
+            KeEnterCriticalRegion();
+            ExAcquirePushLockExclusive(pLock);
+
+            BOOLEAN hasConflict = FALSE;
+            if (gSymInfo.MiCheckForConflictingVad) {
+                PFN_MiCheckForConflictingVad fnCheck =
+                    (PFN_MiCheckForConflictingVad)(gInit.NtBaseOffset + gSymInfo.MiCheckForConflictingVad);
+                PVOID conflict = NULL;
+                __try {
+                    conflict = fnCheck(pTarget,
+                        (ULONG_PTR)(req->StartingVpn << 12),
+                        (ULONG_PTR)(req->EndingVpn   << 12));
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    DbgPrint("[!] VadInsertWorkerThread: MiCheckForConflictingVad exception %08X\n",
+                        GetExceptionCode());
+                }
+                hasConflict = (conflict != NULL);
+            } else {
+                PVOID* pFbRoot = (PVOID*)((ULONG_PTR)pTarget + gSymInfo.VADRoot);
+                hasConflict = VadConflictWalkUnlocked(
+                    (pFbRoot && MmIsAddressValid(pFbRoot)) ? *pFbRoot : NULL,
+                    &gSymInfo, req->StartingVpn, req->EndingVpn);
+            }
+
+            if (hasConflict) {
+                ExReleasePushLockExclusive(pLock);
+                KeLeaveCriticalRegion();
+                DbgPrint("[-] VadInsertWorkerThread: conflicting VAD for VPN 0x%llx-0x%llx\n",
+                    req->StartingVpn, req->EndingVpn);
+                if (gSymInfo.MiRemoveVadCharges) {
+                    PFN_MiRemoveVadCharges fnRollback =
+                        (PFN_MiRemoveVadCharges)(gInit.NtBaseOffset + gSymInfo.MiRemoveVadCharges);
+                    fnRollback(newNode, pTarget);
+                }
+                VadFreeNode(newNode);
+                req->Result  = STATUS_CONFLICTING_ADDRESSES;
+                req->isValid = FALSE;
+                continue;
+            }
+
+            if (gSymInfo.MiInsertVad) {
+                PFN_MiInsertVad fnInsert =
+                    (PFN_MiInsertVad)(gInit.NtBaseOffset + gSymInfo.MiInsertVad);
+                __try {
+                    fnInsert(newNode, pTarget, 0);
+                    status = STATUS_SUCCESS;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    status = GetExceptionCode();
+                    DbgPrint("[-] VadInsertWorkerThread: MiInsertVad raised exception %08X\n", status);
+                }
+            } else {
+                ExReleasePushLockExclusive(pLock);
+                KeLeaveCriticalRegion();
+                status = VadTreeInsert(pTarget, &gSymInfo, newNode);
+                if (!NT_SUCCESS(status)) {
+                    if (gSymInfo.MiRemoveVadCharges) {
+                        PFN_MiRemoveVadCharges fnRollback =
+                            (PFN_MiRemoveVadCharges)(gInit.NtBaseOffset + gSymInfo.MiRemoveVadCharges);
+                        fnRollback(newNode, pTarget);
+                    }
+                    VadFreeNode(newNode);
+                }
+                req->Result  = status;
+                req->isValid = FALSE;
+                continue;
+            }
+
+            ExReleasePushLockExclusive(pLock);
+            KeLeaveCriticalRegion();
+
+            if (!NT_SUCCESS(status)) {
+                if (gSymInfo.MiRemoveVadCharges) {
+                    PFN_MiRemoveVadCharges fnRollback =
+                        (PFN_MiRemoveVadCharges)(gInit.NtBaseOffset + gSymInfo.MiRemoveVadCharges);
+                    fnRollback(newNode, pTarget);
+                }
+                VadFreeNode(newNode);
+                req->Result  = status;
+                req->isValid = FALSE;
+                continue;
+            }
+        }
+
+        if (NT_SUCCESS(status)) {
+            DbgPrint("[+] VadInsertWorkerThread: inserted node 0x%p into '%s' (VPN 0x%llx-0x%llx)\n",
+                newNode, procName, req->StartingVpn, req->EndingVpn);
+        } else {
+            DbgPrint("[-] VadInsertWorkerThread: insert into '%s' failed %08X\n", procName, status);
+        }
+
+        req->Result  = status;
+        req->isValid = FALSE;
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+// =================================================================
+// VadRemoveWorkerThread
+// Waits for hEventVAD_REMOVE. Reads a VAD_MODIFY_REQUEST with
+// identifier "VREM" and calls VadTreeRemove for the given StartingVpn.
+// If FreeOnRemove is set the unlinked node is also freed via VadFreeNode.
+// =================================================================
+VOID VadRemoveWorkerThread(PVOID Context) {
+    PKEVENT          pEvent = (PKEVENT)Context;
+    PVAD_MODIFY_REQUEST req;
+    PEPROCESS        pTarget;
+    PVOID            removed;
+    NTSTATUS         status;
+    UCHAR            liveWalkMode;
+    const char*      procName;
+
+    while (!g_StopRequested) {
+        pEvent->Header.SignalState = 0;
+        status = KeWaitForSingleObject(pEvent, Executive, KernelMode, FALSE, NULL);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("[-] VadRemoveWorkerThread: wait failed %08X\n", status);
+            break;
+        }
+
+        if (!gVadModifySection) {
+            DbgPrint("[-] VadRemoveWorkerThread: gVadModifySection is NULL\n");
+            continue;
+        }
+
+        req = (PVAD_MODIFY_REQUEST)gVadModifySection;
+
+        if (!req->isValid || memcmp(req->identifier, "VREM", 4) != 0) {
+            DbgPrint("[-] VadRemoveWorkerThread: invalid request\n");
+            continue;
+        }
+
+        // Remove from the same process whose tree was last walked
+        liveWalkMode = (pInSection != NULL) ? ((PINIT)pInSection)->walkMode : 0;
+        procName     = (liveWalkMode == 1) ? gInit.sourceProcess : gInit.targetProcess;
+        pTarget = GetProcessByName(procName,
+            gSymInfo.EProcImageFileName, gSymInfo.EProcActiveProcessLinks);
+        if (!pTarget) {
+            DbgPrint("[-] VadRemoveWorkerThread: process '%s' not found\n", procName);
+            req->Result  = STATUS_NOT_FOUND;
+            req->isValid = FALSE;
+            continue;
+        }
+
+        removed = NULL;
+
+        if (gSymInfo.MiRemoveVad) {
+            removed = VadFindNodeByVpn(pTarget, &gSymInfo, req->StartingVpn);
+            if (!removed) {
+                DbgPrint("[-] VadRemoveWorkerThread: node VPN 0x%llx not found\n", req->StartingVpn);
+                status = STATUS_NOT_FOUND;
+            } else {
+                PFN_MiRemoveVad fnRemove =
+                    (PFN_MiRemoveVad)(gInit.NtBaseOffset + gSymInfo.MiRemoveVad);
+                __try {
+                    fnRemove(removed, pTarget);
+                    status = STATUS_SUCCESS;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    status = GetExceptionCode();
+                    DbgPrint("[-] VadRemoveWorkerThread: MiRemoveVad raised exception %08X\n", status);
+                    removed = NULL;
+                }
+
+                if (NT_SUCCESS(status) && gSymInfo.MiRemoveVadCharges) {
+                    PFN_MiRemoveVadCharges fnCharges =
+                        (PFN_MiRemoveVadCharges)(gInit.NtBaseOffset + gSymInfo.MiRemoveVadCharges);
+                    __try {
+                        fnCharges(removed, pTarget);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        DbgPrint("[!] VadRemoveWorkerThread: MiRemoveVadCharges raised exception %08X (ignored)\n",
+                            GetExceptionCode());
+                    }
+                }
+            }
+        } else {
+            status = VadTreeRemove(pTarget, &gSymInfo, req->StartingVpn, &removed);
+        }
+
+        if (NT_SUCCESS(status)) {
+            DbgPrint("[+] VadRemoveWorkerThread: removed node 0x%p from '%s' (VPN 0x%llx)\n",
+                removed, procName, req->StartingVpn);
+            if (req->FreeOnRemove && removed)
+                VadFreeNode(removed);
+        } else {
+            DbgPrint("[-] VadRemoveWorkerThread: remove from '%s' failed %08X\n", procName, status);
+        }
+
+        req->Result  = status;
+        req->isValid = FALSE;
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }

@@ -20,6 +20,8 @@ typedef unsigned __int64    QWORD, * PQWORD, ** PPQWORD;
 typedef int                 BOOL, * PBOOL, ** PPBOOL;
 typedef void** PPVOID;
 
+// -----------------------------------------------------------------
+
 typedef struct _DEVICE_CONTEXT
 {
 	PDRIVER_OBJECT  pDriverObject;        // driver object ptr
@@ -33,15 +35,55 @@ typedef struct _DEVICE_CONTEXT
 }
 DEVICE_CONTEXT, * PDEVICE_CONTEXT, ** PPDEVICE_CONTEXT;
 
+// -----------------------------------------------------------------
+
+// VAD Types
+/*
+Value			Name							Meaning
+  0			VadNone							Private committed(heap, stack, VirtualAlloc)
+  1			VadDevicePhysicalMemory			MmMapIoSpace device mapping
+  2			VadImageMap						PE image(LoadLibrary, .exe)
+  3			VadAwe							AWE large memory windows
+  4			VadWriteWatch					MEM_WRITE_WATCH regions
+  5			VadLargePages					Large page(MEM_LARGE_PAGES)
+  6			VadRotatePhysical				Rotated physical memory
+  7			VadLargePageSection				Large page + section
+*/
+// MMVAD flags DWORD — stored as raw bits; decoded by the kernel using
+// PDB-derived bit positions (MMVADFlagsOffset, ProtectionBitPos, etc. in SYM_INFO).
+// Windows defines _MMVAD_FLAGS, _MMVAD_FLAGS1, _MMVAD_FLAGS2 over the same DWORD.
+// _MMVAD_FLAGS holds VadType, Protection, PrivateMemory at consistent positions
+// across both _MMVAD_SHORT.u and _MMVAD.Core.u.
+typedef ULONG MMVAD_FLAGS_RAW;
+
+// -----------------------------------------------------------------
+
+// RTL_BALANCED_NODE layout (first 0x18 bytes of every MMVAD)
+// Offset 0x00 = Left  child ptr
+// Offset 0x08 = Right child ptr
+// Offset 0x10 = ParentValue  (parent ptr | Balance in bits [1:0])
+//   Balance: 0 = balanced, 1 = right-heavy (+1), 2 = left-heavy (-1)
+/*
+ULONG_PTR ParentValue = *(ULONG_PTR*)((ULONG_PTR)VADNode + 0x10);
+ULONG     Balance = ParentValue & 0x3;
+PVOID     Parent = (PVOID)(ParentValue & ~(ULONG_PTR)0x3);
+*/
+
+// -----------------------------------------------------------------
 typedef struct _VAD_NODE {
 	int Level;
 	PVOID VADNode;
+	PVOID ParentNode;
+	ULONG Balance;
 	unsigned long long StartingVpn;
 	unsigned long long EndingVpn;
 	unsigned long Protection;
-	//WCHAR FileName[MAX_FILENAME_SIZE];
-	//CHAR FileName[MAX_FILENAME_SIZE];
-	UCHAR FileOffset;
+	ULONG VadFlagsRaw;
+	USHORT FileOffset;
+	ULONG ControlAreaFlags;      // raw _CONTROL_AREA.u.LongFlags
+	ULONG MappedViews;           // _CONTROL_AREA.NumberOfMappedViews  (>1 = shared across processes)
+	ULONG UserReferences;        // _CONTROL_AREA.NumberOfUserReferences
+	BOOLEAN IsVadShort;          // TRUE = _MMVAD_SHORT; FALSE = _MMVAD (full)
 	LIST_ENTRY ListEntry;
 } VAD_NODE, * PVAD_NODE;
 
@@ -50,6 +92,24 @@ typedef struct _VAD_NODE {
 typedef struct _VAD_NODE_FILE {
 	CHAR FileName[MAX_FILENAME_SIZE];
 } VAD_NODE_FILE, * PVAD_NODE_FILE;
+
+// -----------------------------------------------------------------
+
+typedef enum _PTE_TYPE {
+	PTE_HARDWARE	= 0,	// Valid=1 -> physically present, PFN Valid
+	PTE_PROTOTYPE	= 1,	// Valid=0, Prototype=1 -> section/file backed
+	PTE_TRANSITION	= 2,	// Valid=0, Prototype=0, Transition=1 -> being paged
+	PTE_PAGEFILE	= 3,	// Valid=0, Prototype=0, Transition=0, PFN!=0 -> in pagefile
+	PTE_DEMANDZERO	= 4,	// Valid=0, Prototype=0, Transition=0, PFN=0 -> never touched, zero-fill on demand
+} PTE_TYPE;
+
+static __forceinline PTE_TYPE ClassifyPte(ULONG64 pte) {
+	if (pte & 0x1)				return PTE_HARDWARE;
+	if (pte & (1ULL << 10))		return PTE_PROTOTYPE;
+	if (pte & (1ULL << 11))		return PTE_TRANSITION;
+	if ((pte >> 32) != 0)		return PTE_PAGEFILE;
+	return PTE_DEMANDZERO;
+}
 
 // -----------------------------------------------------------------
 
@@ -64,6 +124,8 @@ typedef struct _INIT {
 	DWORD EPROCActiveProcessLinksOfsset;
 	DWORD EPROCUniqueProcessIdOffset;
 	ULONG requestedProtection;
+	UCHAR walkMode;    // 0 = target only (default)  1 = source only  2 = both (target→sentinel→source)
+	UCHAR reserved[3]; // padding to 4-byte boundary
 } INIT, * PINIT;
 
 // -----------------------------------------------------------------
@@ -91,6 +153,9 @@ typedef struct _SYM_INFO {
 	DWORD MMVADSubsection;
 	DWORD MMVADControlArea;
 	DWORD MMVADCAFilePointer;
+	DWORD MMCAFlags;             // offset of _CONTROL_AREA.u (MMSECTION_FLAGS LongFlags dword)
+	DWORD MMCAMappedViews;       // offset of _CONTROL_AREA.NumberOfMappedViews
+	DWORD MMCAUserReferences;    // offset of _CONTROL_AREA.NumberOfUserReferences
 	DWORD FILEOBJECTFileName;
 	DWORD EProcImageFileName;
 	DWORD PEB;
@@ -99,6 +164,27 @@ typedef struct _SYM_INFO {
 	DWORD LdrListEntry;
 	DWORD LdrBaseDllName;
 	DWORD LdrBaseDllBase;
+	DWORD ParentValue;           // offset of RTL_BALANCED_NODE.ParentValue within MMVAD (parent ptr | balance[1:0])
+	DWORD AddressCreationLock;   // offset of EX_PUSH_LOCK AddressCreationLock within EPROCESS
+	DWORD VadHint;               // offset of VadHint PVOID within EPROCESS (cached last-accessed VAD node)
+	DWORD VadFreeHint;           // offset of VadFreeHint PVOID within EPROCESS (cached near-free-space VAD node)
+	// MMVAD_FLAGS* layout — offsets and bit positions derived from PDB at runtime.
+	// The kernel reads the raw DWORD at (VADNode + MMVADFlagsOffset) and extracts
+	// fields by position rather than relying on a fixed compile-time struct layout.
+	DWORD MMVADFlagsOffset;      // byte offset of flags DWORD within _MMVAD_SHORT.u (same for all MMVAD types)
+	DWORD ProtectionBitPos;      // Protection bit position (from _MMVAD_FLAGS)
+	DWORD ProtectionBitLen;
+	DWORD VadTypeBitPos;         // VadType bit position
+	DWORD VadTypeBitLen;
+	DWORD PrivateMemoryBitPos;   // PrivateMemory bit position
+	// Kernel MM internal helpers — resolved via PDB symbol offset from ntoskrnl base
+	// MiCheckForConflictingVad(EPROCESS*, ULONG_PTR StartVA, ULONG_PTR EndVA) -> MMVAD* or NULL
+	// NOTE: takes raw VAs, shifts >> 12 internally — do NOT pass VPNs
+	ULONG64 MiCheckForConflictingVad;
+	ULONG64 MiInsertVad;
+	ULONG64 MiInsertVadCharges;       // (MMVAD*, EPROCESS*) -> NTSTATUS
+	ULONG64 MiRemoveVad;              // (MMVAD*, EPROCESS*)
+	ULONG64 MiRemoveVadCharges;       // (MMVAD*, EPROCESS*)
 } SYM_INFO, * PSYM_INFO;
 
 // -----------------------------------------------------------------
@@ -257,34 +343,23 @@ typedef struct _PHYSICAL_4KB {
 } PHYSICAL_4KB, * PPHYSICAL_4KB;
 
 // -----------------------------------------------------------------
-// The Windows Header Flags for Protections are wrong WTF. So we reverse and redefine them.
-
+// MMVAD internal protection encoding (NOT Win32 PAGE_* constants).
+// The 5-bit Protection field in _MMVAD_FLAGS stores these values directly.
 typedef enum _PROTECTION
 {
-	_PAGE_READONLY = 0x01, // Read-only access to the page
-	_PAGE_READWRITE = 0x04, // Read and write access to the page
-	_PAGE_WRITECOPY = 0x07, // Copy-on-write access to the page
-	_PAGE_EXECUTE = 0x10, // Execute access to the page
-	_PAGE_NOACCESS = 0x18, // No access to the page
-	_PAGE_EXECUTE_READ = 0x20  // Execute and read access to the page
+	_PAGE_NOACCESS          = 0x00, // MM_ZERO_ACCESS
+	_PAGE_READONLY          = 0x01, // MM_READONLY
+	_PAGE_EXECUTE           = 0x02, // MM_EXECUTE
+	_PAGE_EXECUTE_READ      = 0x03, // MM_EXECUTE_READ (RX)
+	_PAGE_READWRITE         = 0x04, // MM_READWRITE
+	_PAGE_WRITECOPY         = 0x05, // MM_WRITECOPY
+	_PAGE_EXECUTE_READWRITE = 0x06, // MM_EXECUTE_READWRITE
+	_PAGE_EXECUTE_WRITECOPY = 0x07  // MM_EXECUTE_WRITECOPY (DLL .text sections)
 } PROTECTION;
 
 // -----------------------------------------------------------------
-
-typedef union _MMVAD_FLAGS {
-	struct {
-		unsigned long Lock : 1; // Bit 0:0
-		unsigned long LockContended : 1; // Bit 1:1
-		unsigned long DeleteInProgress : 1; // Bit 2:2
-		unsigned long NoChange : 1; // Bit 3:3
-		unsigned long VadType : 3; // Bit 4:6
-		unsigned long Protection : 5; // Bit 7:11
-		unsigned long PreferredNode : 6; // Bit 12:17
-		unsigned long PageSize : 20; // Bit 18:19
-		unsigned long PrivateMemory : 1; // Bit 20:20
-	};
-	unsigned long LongFlags;
-} MMVAD_FLAGS;
+// Note: compile-time MMVAD_FLAGS structs are intentionally omitted.
+// All field positions are resolved from the PDB at runtime (see SYM_INFO).
 
 // -----------------------------------------------------------------
 // Ref: https://github.com/reactos/reactos/blob/c03d7794b8a378001d8f15873a61ee108ba18a4b/sdk/include/ndk/arm64/mmtypes.h#L63
@@ -633,12 +708,34 @@ typedef struct _WRITE_PHYS_REQUEST {
 // -----------------------------------------------------------------
 
 typedef struct _READ_PHYS_REQUEST {
-    CHAR identifier[4];                         // Identifier "RPHY"
-    PVOID targetVirtualAddress;                 // Target virtual address to resolve
-    BOOLEAN isValid;                           // Request validity flag
-    ULONG reserved;                            // Reserved for alignment
-    // The 4KB physical page content will be copied starting here
-    UCHAR pageData[MAX_READ_BUFFER_SIZE];      // Physical page data (4KB)
+	CHAR identifier[4];                         // Identifier "RPHY"
+	PVOID targetVirtualAddress;                 // Target virtual address to resolve
+	BOOLEAN isValid;                           // Request validity flag
+	ULONG reserved;                            // Reserved for alignment
+	// The 4KB physical page content will be copied starting here
+	UCHAR pageData[MAX_READ_BUFFER_SIZE];      // Physical page data (4KB)
 } READ_PHYS_REQUEST, *PREAD_PHYS_REQUEST;
+
+// -----------------------------------------------------------------
+// Shared request for VadTreeInsert / VadTreeRemove operations.
+// Usermode fills the request and signals the appropriate event.
+// Kernel writes the NTSTATUS result back before clearing isValid.
+// identifier[4]:  "VINS" = insert a new node
+//                 "VREM" = remove an existing node
+
+typedef struct _VAD_MODIFY_REQUEST {
+	CHAR               identifier[4];       // "VINS", "VREM", or "QHNT"
+	unsigned long long StartingVpn;         // VINS/VREM: region start VPN
+	unsigned long long EndingVpn;           // VINS: region end VPN
+	ULONG              Protection;          // VINS: MMVAD protection value
+	ULONG              VadTypeRaw;          // VINS: raw _MMVAD_FLAGS dword
+	SIZE_T             NodeSize;            // VINS: pool alloc size (0 = 0x80 default)
+	BOOLEAN            FreeOnRemove;        // VREM: TRUE → call VadFreeNode after unlink
+	BOOLEAN            isValid;             // set by usermode; cleared by kernel on completion
+	NTSTATUS           Result;              // NTSTATUS written by kernel on completion
+	// QHNT response fields — written by kernel, read by usermode
+	unsigned long long SuggestedUserVpn;    // next free VPN in user space  (0 if none)
+	unsigned long long SuggestedKernelVpn;  // next free VPN in kernel space (0 if none)
+} VAD_MODIFY_REQUEST, *PVAD_MODIFY_REQUEST;
 
 // -----------------------------------------------------------------
