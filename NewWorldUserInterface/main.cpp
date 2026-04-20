@@ -23,7 +23,10 @@
 #define MAPPING_NOTIFICATION_INIT_EVENT L"Global\\InitializeMemory"
 #define MAPPING_NOTIFICATION_USERMODEREADY_EVENT L"Global\\UserModeReadEvent"
 #define MAPPING_NOTIFICATION_WRITE_PHYS_EVENT L"Global\\WritePhysicalMemoryEvent"
-#define MAPPING_NOTIFICATION_READ_PHYS_EVENT L"Global\\ReadPhysicalMemoryEvent"
+#define MAPPING_NOTIFICATION_READ_PHYS_EVENT  L"Global\\ReadPhysicalMemoryEvent"
+#define MAPPING_NAME_VAD_MODIFY               L"Global\\VADModifyRequest"
+#define MAPPING_NOTIFICATION_VAD_INSERT_EVENT L"Global\\VADInsertEvent"
+#define MAPPING_NOTIFICATION_VAD_REMOVE_EVENT L"Global\\VADRemoveEvent"
 // -----------------------------------------------------------------
 
 typedef struct _INIT {
@@ -37,11 +40,16 @@ typedef struct _INIT {
 	DWORD EPROCActiveProcessLinksOfsset;
 	DWORD EPROCUniqueProcessIdOffset;
 	ULONG requestedProtection;
+	UCHAR walkMode;    // 0=target only  1=source only  2=both
+	UCHAR reserved[3]; // padding
 } INIT, * PINIT;
 // -----------------------------------------------------------------
 #define MAX_FILENAME_SIZE 80
 #define MAX_WRITE_BUFFER_SIZE 4096
 #define MAX_READ_BUFFER_SIZE 4096
+// Section sizes — must match the values in NewWorldInterface\main.c
+#define VAD_SECTION_SIZE       0x40000   // 256 KB — ~3200 VAD_NODE slots
+#define VAD_FILENAME_SEC_SIZE  0x10000   // 64 KB  — ~800 VAD_NODE_FILE slots
 
 // Define PHYSICAL_ADDRESS for user-mode
 typedef union _PHYSICAL_ADDRESS {
@@ -57,26 +65,36 @@ typedef union _PHYSICAL_ADDRESS {
 } PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
 
 // -----------------------------------------------------------------
+// Must be byte-identical to VAD_NODE in SharedTypes.h (kernel side).
+// _MMVAD_FLAGS and _MMSECTION_FLAGS are decoded at runtime using PDB-derived layout tables.
 typedef struct _VAD_NODE {
-	int Level;
-	PVOID VADNode;
+	int                Level;
+	PVOID              VADNode;
+	PVOID              ParentNode;
+	ULONG              Balance;
 	unsigned long long StartingVpn;
 	unsigned long long EndingVpn;
-	unsigned long Protection;
-	//CHAR FileName[MAX_FILENAME_SIZE];
-	UCHAR FileOffset;
-	LIST_ENTRY ListEntry;
+	unsigned long      Protection;
+	ULONG              VadFlagsRaw;
+	USHORT             FileOffset;
+	ULONG              ControlAreaFlags;
+	ULONG              MappedViews;      // _CONTROL_AREA.NumberOfMappedViews  (>1 = shared)
+	ULONG              UserReferences;   // _CONTROL_AREA.NumberOfUserReferences
+	BOOLEAN            IsVadShort;
+	LIST_ENTRY         ListEntry;
 } VAD_NODE, * PVAD_NODE;
 // -----------------------------------------------------------------
-// The Windows Header Flags for Protections are wrong WTF. So we reverse and redefine them.
+// MMVAD internal protection encoding (NOT Win32 PAGE_* constants).
 typedef enum _PROTECTION
 {
-	_PAGE_READONLY = 0x01, // Read-only access to the page
-	_PAGE_READWRITE = 0x04, // Read and write access to the page
-	_PAGE_WRITECOPY = 0x07, // Copy-on-write access to the page
-	_PAGE_EXECUTE = 0x10, // Execute access to the page
-	_PAGE_NOACCESS = 0x18, // No access to the page
-	_PAGE_EXECUTE_READ = 0x20  // Execute and read access to the page
+	_PAGE_NOACCESS          = 0x00, // MM_ZERO_ACCESS
+	_PAGE_READONLY          = 0x01, // MM_READONLY
+	_PAGE_EXECUTE           = 0x02, // MM_EXECUTE
+	_PAGE_EXECUTE_READ      = 0x03, // MM_EXECUTE_READ (RX)
+	_PAGE_READWRITE         = 0x04, // MM_READWRITE
+	_PAGE_WRITECOPY         = 0x05, // MM_WRITECOPY
+	_PAGE_EXECUTE_READWRITE = 0x06, // MM_EXECUTE_READWRITE
+	_PAGE_EXECUTE_WRITECOPY = 0x07  // MM_EXECUTE_WRITECOPY (DLL .text sections)
 } PROTECTION;
 // -----------------------------------------------------------------
 typedef struct _VAD_NODE_FILE {
@@ -109,6 +127,23 @@ typedef struct _READ_PHYS_REQUEST {
     // The 4KB physical page content will be copied starting here
     UCHAR pageData[MAX_READ_BUFFER_SIZE];      // Physical page data (4KB)
 } READ_PHYS_REQUEST, *PREAD_PHYS_REQUEST;
+
+// -----------------------------------------------------------------
+// Usermode mirror of VAD_MODIFY_REQUEST (kernel side SharedTypes.h)
+typedef struct _VAD_MODIFY_REQUEST {
+	CHAR               identifier[4];       // "VINS", "VREM", or "QHNT"
+	unsigned long long StartingVpn;         // VINS/VREM: region start VPN
+	unsigned long long EndingVpn;           // VINS: region end VPN
+	ULONG              Protection;          // VINS: MMVAD protection value
+	ULONG              VadTypeRaw;          // VINS: raw _MMVAD_FLAGS DWORD
+	SIZE_T             NodeSize;            // VINS: alloc size (0 = kernel default 0x80)
+	BOOLEAN            FreeOnRemove;        // VREM: driver frees pool after unlink
+	BOOLEAN            isValid;             // set by us; cleared by kernel on completion
+	LONG               Result;              // NTSTATUS written by kernel
+	// QHNT response fields
+	unsigned long long SuggestedUserVpn;    // next free VPN in user space  (0 if none)
+	unsigned long long SuggestedKernelVpn;  // next free VPN in kernel space (0 if none)
+} VAD_MODIFY_REQUEST, *PVAD_MODIFY_REQUEST;
 
 // =================================================================
 // GLOBAL VARIABLES
@@ -163,6 +198,51 @@ typedef struct symbol_ctx_t {
 	DWORD64 pdb_base_addr;
 	HANDLE sym_handle;
 } symbol_ctx;
+
+// -----------------------------------------------------------------
+// Bitfield member descriptor: one entry per member of a bitfield struct/union.
+typedef struct _BITFIELD_MEMBER {
+	char   name[64];   // member name
+	DWORD  bitPos;     // absolute bit position within the containing DWORD (byte_offset*8 + bit_position)
+	DWORD  bitLen;     // bit width
+} BITFIELD_MEMBER;
+
+// Extract a bit-field value from a raw DWORD given position + length.
+static inline ULONG ExtractBits(ULONG raw, DWORD bitPos, DWORD bitLen) {
+	if (bitLen == 0 || bitLen >= 32) return 0;
+	return (raw >> bitPos) & ((1u << bitLen) - 1u);
+}
+
+// Find a named member in a BITFIELD_MEMBER array and return a pointer to it, or NULL.
+static const BITFIELD_MEMBER* FindBitfieldMember(
+	const BITFIELD_MEMBER* arr, DWORD count, const char* name) {
+	for (DWORD i = 0; i < count; i++)
+		if (_stricmp(arr[i].name, name) == 0) return &arr[i];
+	return NULL;
+}
+
+// -----------------------------------------------------------------
+// Runtime bitfield layout tables, populated from the PDB at startup.
+#define MAX_BITFIELD_MEMBERS 64
+typedef struct _BITFIELD_LAYOUT {
+	BITFIELD_MEMBER members[MAX_BITFIELD_MEMBERS];
+	DWORD           count;
+	BOOL            valid;  // TRUE once populated from PDB
+} BITFIELD_LAYOUT;
+
+// One layout per MMVAD_FLAGS variant + _MMSECTION_FLAGS.
+static BITFIELD_LAYOUT g_MmVadFlags;         // _MMVAD_FLAGS  (primary: _MMVAD.Core.u)
+static BITFIELD_LAYOUT g_MmVadFlags1;        // _MMVAD_FLAGS1 (supplemental: _MMVAD.u for special types)
+static BITFIELD_LAYOUT g_MmVadFlags2;        // _MMVAD_FLAGS2 (supplemental: _MMVAD.u for image)
+static BITFIELD_LAYOUT g_MmSectionFlags;     // _MMSECTION_FLAGS
+
+// Convenience: get a decoded field value from any layout.
+static inline ULONG GetFlag(const BITFIELD_LAYOUT* layout, ULONG raw, const char* name) {
+	const BITFIELD_MEMBER* m = FindBitfieldMember(layout->members, layout->count, name);
+	if (!m || m->bitLen == 0) return 0;
+	return ExtractBits(raw, m->bitPos, m->bitLen);
+}
+// -----------------------------------------------------------------
 
 PBYTE ReadFullFileW(LPCWSTR fileName) {
 	HANDLE hFile = CreateFileW(fileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -529,6 +609,87 @@ DWORD GetFieldOffset(symbol_ctx* ctx, LPCSTR struct_name, LPCWSTR field_name) {
 	free(childrenParam);
 	return offset;
 }
+// Enumerate all members of a struct/union from the PDB, recording byte-offset,
+// bit-position and bit-length for each.  Returns the number of members found.
+// pOut must point to a buffer of at least maxOut BITFIELD_MEMBER entries.
+// Helper: enumerate bitfield members from a type ID, recursing into anonymous nested UDTs.
+// In PDB, all direct children of a struct/union are SymTagData.
+// An anonymous inner struct is a SymTagData child whose *type* is SymTagUDT — we recurse into it.
+static DWORD EnumBitfieldMembersById(HANDLE symHandle, DWORD64 base,
+	DWORD typeId, DWORD byteBase,
+	BITFIELD_MEMBER* pOut, DWORD maxOut) {
+
+	DWORD count = 0;
+	if (!SymGetTypeInfo(symHandle, base, typeId, TI_GET_CHILDRENCOUNT, &count) || count == 0)
+		return 0;
+
+	TI_FINDCHILDREN_PARAMS* cp = (TI_FINDCHILDREN_PARAMS*)calloc(
+		1, sizeof(TI_FINDCHILDREN_PARAMS) + count * sizeof(ULONG));
+	if (!cp) return 0;
+	cp->Count = count;
+	SymGetTypeInfo(symHandle, base, typeId, TI_FINDCHILDREN, cp);
+
+	DWORD found = 0;
+	for (DWORD i = 0; i < count && found < maxOut; i++) {
+		ULONG id = cp->ChildId[i];
+
+		// Get the type of this child member
+		DWORD childTypeId = 0;
+		SymGetTypeInfo(symHandle, base, id, TI_GET_TYPE, &childTypeId);
+
+		// Check if the child's type is a UDT (anonymous nested struct/union)
+		DWORD typeTag = 0;
+		if (childTypeId)
+			SymGetTypeInfo(symHandle, base, childTypeId, TI_GET_SYMTAG, &typeTag);
+
+		if (typeTag == 11 /* SymTagUDT */) {
+			// Anonymous nested struct/union — get its byte offset and recurse into its type
+			DWORD nestedByteOffset = 0;
+			SymGetTypeInfo(symHandle, base, id, TI_GET_OFFSET, &nestedByteOffset);
+			DWORD sub = EnumBitfieldMembersById(symHandle, base, childTypeId,
+				byteBase + nestedByteOffset, pOut + found, maxOut - found);
+			found += sub;
+		} else {
+			// Regular member (bitfield or plain field) — record it
+			WCHAR* wname = NULL;
+			SymGetTypeInfo(symHandle, base, id, TI_GET_SYMNAME, &wname);
+			if (!wname) continue;
+
+			DWORD memberByteOffset = 0, bitPos = 0;
+			ULONGLONG bitLen = 0;
+			SymGetTypeInfo(symHandle, base, id, TI_GET_OFFSET,      &memberByteOffset);
+			SymGetTypeInfo(symHandle, base, id, TI_GET_BITPOSITION, &bitPos);
+			SymGetTypeInfo(symHandle, base, id, TI_GET_LENGTH,      &bitLen);
+
+			WideCharToMultiByte(CP_UTF8, 0, wname, -1,
+				pOut[found].name, (int)sizeof(pOut[found].name), NULL, NULL);
+			pOut[found].bitPos = (byteBase + memberByteOffset) * 8 + bitPos;
+			pOut[found].bitLen = (DWORD)bitLen;
+			LocalFree(wname);
+			found++;
+		}
+	}
+	free(cp);
+	return found;
+}
+
+DWORD GetBitfieldMembers(symbol_ctx* ctx, LPCSTR struct_name,
+	BITFIELD_MEMBER* pOut, DWORD maxOut) {
+	SYMBOL_INFO_PACKAGE si = { 0 };
+	si.si.SizeOfStruct = sizeof(SYMBOL_INFO);
+	si.si.MaxNameLen   = sizeof(si.name);
+	if (!SymGetTypeFromName(ctx->sym_handle, ctx->pdb_base_addr, struct_name, &si.si)) {
+		printf("[-] GetBitfieldMembers: SymGetTypeFromName failed for '%s': %d\n",
+			struct_name, GetLastError());
+		return 0;
+	}
+	DWORD found = EnumBitfieldMembersById(ctx->sym_handle, ctx->pdb_base_addr,
+		si.si.TypeIndex, 0, pOut, maxOut);
+	if (found == 0)
+		printf("[-] GetBitfieldMembers: no members found for '%s'\n", struct_name);
+	return found;
+}
+
 void UnloadSymbols(symbol_ctx* ctx, BOOL delete_pdb) {
 	if (ctx == NULL) {
 		return;
@@ -601,7 +762,8 @@ unsigned long long GetAndInsertSymbol(const char* str, symbol_ctx* symCtx, DWORD
 		printf("[-] Maximum reached...\n");
 		return 0x0;
 	}
-	PSYMBOL CurrSymbolInArray = (PSYMBOL)((PINIT)SymbolsArray + sizeof(INIT));
+	// Cast to PBYTE so +sizeof(INIT) is exactly sizeof(INIT) bytes, not sizeof(INIT)² bytes.
+	PSYMBOL CurrSymbolInArray = (PSYMBOL)((PBYTE)SymbolsArray + sizeof(INIT));
 
 	if (!useOffset) {
 		offset = GetSymbolOffset(symCtx, str);
@@ -750,14 +912,71 @@ void CheckModifiedMemory(PVOID address, size_t size) {
 // -----------------------------------------------------------------
 const char* ProtectionToStr(PROTECTION prot) {
 	switch (prot) {
-	case _PAGE_NOACCESS:     return "PAGE_NOACCESS";
-	case _PAGE_READONLY:     return "PAGE_READONLY";
-	case _PAGE_READWRITE:    return "PAGE_READWRITE";
-	case _PAGE_WRITECOPY:    return "PAGE_WRITECOPY";
-	case _PAGE_EXECUTE:      return "PAGE_EXECUTE";
-	case _PAGE_EXECUTE_READ: return "PAGE_EXECUTE_READ";
-	default:                   return "UNKNOWN_PROTECTION";
+	case _PAGE_NOACCESS:          return "PAGE_NOACCESS";
+	case _PAGE_READONLY:          return "PAGE_READONLY";
+	case _PAGE_EXECUTE:           return "PAGE_EXECUTE";
+	case _PAGE_EXECUTE_READ:      return "PAGE_EXECUTE_READ";
+	case _PAGE_READWRITE:         return "PAGE_READWRITE";
+	case _PAGE_WRITECOPY:         return "PAGE_WRITECOPY";
+	case _PAGE_EXECUTE_READWRITE: return "PAGE_EXECUTE_READWRITE";
+	case _PAGE_EXECUTE_WRITECOPY: return "PAGE_EXECUTE_WRITECOPY";
+	default:                      return "UNKNOWN_PROTECTION";
 	}
+}
+// -----------------------------------------------------------------
+// Build a short type-tag string from VadFlagsRaw + ControlAreaFlags using PDB layouts.
+// Tag priority: Private > Image > File > Pagefile > Physical > Global > Shared
+static void BuildVadTypeTag(ULONG vf, ULONG ca, BOOLEAN isShort, ULONG mappedViews, ULONG userRefs, char* out, size_t outLen) {
+	// _MMVAD_FLAGS is the single primary layout for both _MMVAD_SHORT and _MMVAD
+	const BITFIELD_LAYOUT* flagLayout = g_MmVadFlags.valid ? &g_MmVadFlags : NULL;
+	if (!flagLayout) { strcpy_s(out, outLen, ""); return; }
+
+	ULONG vadType    = GetFlag(flagLayout, vf, "VadType");
+	ULONG isPrivate  = GetFlag(flagLayout, vf, "PrivateMemory");
+	ULONG isImage    = GetFlag(&g_MmSectionFlags, ca, "Image");
+	ULONG isFile     = GetFlag(&g_MmSectionFlags, ca, "File");
+	ULONG isPhys     = GetFlag(&g_MmSectionFlags, ca, "PhysicalMemory");
+	ULONG isGlobal   = GetFlag(&g_MmSectionFlags, ca, "GlobalMemory");
+	ULONG isNullFP   = GetFlag(&g_MmSectionFlags, ca, "FilePointerNull");
+	static const char* vadTypeNames[] = {
+		"", "DevPhys", "Image", "AWE", "WrtWatch", "LrgPage", "RotPhys", "LrgPgSec"
+	};
+	char buf[48] = "";
+	if (isPrivate) {
+		switch (vadType) {
+		case 0: strcpy_s(buf, sizeof(buf), "Private");  break;
+		case 3: strcpy_s(buf, sizeof(buf), "AWE");      break;
+		case 4: strcpy_s(buf, sizeof(buf), "WrtWatch"); break;
+		case 5: strcpy_s(buf, sizeof(buf), "LrgPage");  break;
+		default: snprintf(buf, sizeof(buf), "Prv[%u]", vadType); break;
+		}
+	} else if (ca != 0) {
+		if (vadType == 1 || isPhys)         strcpy_s(buf, sizeof(buf), "Physical");
+		else if (isImage)                   strcpy_s(buf, sizeof(buf), "Image");
+		else if (isFile && !isNullFP)       strcpy_s(buf, sizeof(buf), "File");
+		else if (isGlobal && isNullFP)      strcpy_s(buf, sizeof(buf), "Global/Shared");
+		else if (isGlobal)                  strcpy_s(buf, sizeof(buf), "Global");
+		else if (isNullFP)                  strcpy_s(buf, sizeof(buf), "Pagefile");
+		else if (vadType < 8 && vadType > 0) strcpy_s(buf, sizeof(buf), vadTypeNames[vadType]);
+		else                                strcpy_s(buf, sizeof(buf), "Section");
+	} else {
+		if (vadType < 8 && vadType > 0)     strcpy_s(buf, sizeof(buf), vadTypeNames[vadType]);
+		else                                strcpy_s(buf, sizeof(buf), "Reserve");
+	}
+	// Append sharing breakdown: [Nv: Kk+Uu]
+	//   N = total mapped views, K = kernel views (MappedViews - UserReferences), U = user views
+	// K>0 means the kernel (driver/Mm) has the section mapped too, not just user processes.
+	if (mappedViews > 0) {
+		ULONG kernelViews = (mappedViews > userRefs) ? (mappedViews - userRefs) : 0;
+		ULONG userViews   = mappedViews - kernelViews;
+		char suffix[32];
+		if (kernelViews > 0)
+			snprintf(suffix, sizeof(suffix), " [%uv: %uk+%uu]", mappedViews, kernelViews, userViews);
+		else
+			snprintf(suffix, sizeof(suffix), " [%uv: %uu]", mappedViews, userViews);
+		strncat_s(buf, sizeof(buf), suffix, _TRUNCATE);
+	}
+	strcpy_s(out, outLen, buf);
 }
 // -----------------------------------------------------------------
 void GetSymOffsets(PVOID SecBase, size_t SecSize,
@@ -766,96 +985,60 @@ void GetSymOffsets(PVOID SecBase, size_t SecSize,
 	if (SecBase == NULL)
 		return;
 
-	PVAD_NODE node = (PVAD_NODE)SecBase;
+	PVAD_NODE      node         = (PVAD_NODE)SecBase;
 	PVAD_NODE_FILE FileNameBase = (PVAD_NODE_FILE)FileNameSecBase;
-
-	// Calculate maximum symbols based on remaining size
-	size_t maxSymCount = SecSize / sizeof(VAD_NODE);
+	size_t maxSymCount  = SecSize / sizeof(VAD_NODE);
 	size_t maxFileNames = FileNameSecSize / sizeof(VAD_NODE_FILE);
-	PROTECTION prot;
 
-	// Print header with consistent column widths
-	printf("\n%-6s %-26s %-12s %-12s %-6s %-35s %-30s\n",
-		"Level", "VADNode", "StartingVpn", "EndingVpn", "4KBs", "FileName", "Protection");
-	printf("%-6s %-26s %-12s %-12s %-6s %-35s %-30s\n",
-		"-----", "-------", "-----------", "---------", "---------", "---------", "----------");
+	printf("\n%-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+		"Lvl", "VADNode", "StartingVpn", "EndingVpn", "4KBs",
+		"Protection", "Type", "FileName");
+	printf("%-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+		"-----", "-----------------", "-------------", "-------------", "---------",
+		"--------------------------", "--------------", "-----------------------------------");
 
 	__try {
 		for (size_t i = 0; i < maxSymCount - 1; i++) {
-			if (node[i].Level == 0)
-				continue; // Skip if Level is 0
+			if (node[i].Level == 0) continue;
 
-			prot = (PROTECTION)node[i].Protection;
-			const char* protStr = ProtectionToStr(prot);
-			DWORD64 rangeSize = node[i].EndingVpn - node[i].StartingVpn;
+			if (node[i].Level == -1 && node[i].StartingVpn == 0xFFFFFFFFFFFFFFFEULL) {
+				printf("\n  ---- [ Source Process ] -------------------------------------------------------------------------\n");
+				printf("%-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+					"Lvl", "VADNode", "StartingVpn", "EndingVpn", "4KBs",
+					"Protection", "Type", "FileName");
+				printf("%-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+					"-----", "-----------------", "-------------", "-------------", "---------",
+					"--------------------------", "--------------", "-----------------------------------");
+				continue;
+			}
 
-			if (node[i].FileOffset == 0 || node[i].FileOffset >= maxFileNames) {
-				printf("%-6d 0x%-24p 0x%010I64x 0x%010I64x %-6d %-35s %-15s [0x%lx]\n",
-					node[i].Level,
-					node[i].VADNode,
-					node[i].StartingVpn,
-					node[i].EndingVpn,
-					node[i].EndingVpn - node[i].StartingVpn,
-					"-",  // No filename
-					protStr,
-					node[i].Protection);
-			}
-			else {
-				printf("%-6d 0x%-24p 0x%010I64x 0x%010I64x %-6d %-35s %-15s [0x%lx]\n",
-					node[i].Level,
-					node[i].VADNode,
-					node[i].StartingVpn,
-					node[i].EndingVpn,
-					node[i].EndingVpn - node[i].StartingVpn,
-					FileNameBase[node[i].FileOffset].FileName,
-					protStr,
-					node[i].Protection);
-			}
+			PROTECTION prot = (PROTECTION)node[i].Protection;
+			const char* fileName = (node[i].FileOffset && node[i].FileOffset < maxFileNames)
+				? FileNameBase[node[i].FileOffset].FileName : "-";
+
+			char typeTag[48] = "";
+			if (g_MmSectionFlags.valid)
+				BuildVadTypeTag(node[i].VadFlagsRaw, node[i].ControlAreaFlags, node[i].IsVadShort,
+					node[i].MappedViews, node[i].UserReferences, typeTag, sizeof(typeTag));
+
+			char protBuf[40];
+			snprintf(protBuf, sizeof(protBuf), "%-22s [0x%x]",
+				ProtectionToStr(prot), node[i].Protection);
+
+			printf("%-5d  0x%-16p  0x%011I64x  0x%011I64x  %-9I64u  %-26s  %-14s  %-35s\n",
+				node[i].Level,
+				node[i].VADNode,
+				node[i].StartingVpn,
+				node[i].EndingVpn,
+				node[i].EndingVpn - node[i].StartingVpn + 1,
+				protBuf,
+				typeTag,
+				fileName);
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
-		printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
+		printf("Exception when reading VAD data: 0x%lx\n", GetExceptionCode());
 	}
-	//// Print header with consistent column widths
-	//printf("\nLevel      VADNode                     StartingVpn        EndingVpn          FileName          Protection\n");
-	//printf("-----      -------                     -----------        ---------          --------          --------\n");
-	//__try {
-	//	for (size_t i = 0; i < maxSymCount - 1; i++) {
-	//		if (node[i].Level == 0 || node[i].Level == 0) {
-	//			continue; // Skip if Level is 0
-	//		}
-	//		prot = (PROTECTION)node[i].Protection;
-	//		if (node[i].FileOffset == 0) {
-	//			printf("%-10d 0x%p          0x%010I64x     0x%010I64x | %d - %s [0x%lx]",
-	//				node[i].Level,
-	//				node[i].VADNode,
-	//				node[i].StartingVpn,
-	//				node[i].EndingVpn,
-	//				node[i].EndingVpn - node[i].StartingVpn,
-	//				ProtectionToStr(prot),
-	//				node[i].Protection);
-	//		} else {
-	//			if (node[i].FileOffset >= maxFileNames) {
-	//				printf("FileOffset out of bounds: %d\n", node[i].FileOffset);
-	//				continue; // Skip if FileOffset is out of bounds
-	//			}
-	//			printf("%-10d 0x%p          0x%010I64x     0x%010I64x     %s | %d - %s [0x%lx]",
-	//				node[i].Level,
-	//				node[i].VADNode,
-	//				node[i].StartingVpn,
-	//				node[i].EndingVpn,
-	//				FileNameBase[node[i].FileOffset].FileName,
-	//				node[i].EndingVpn - node[i].StartingVpn,
-	//				ProtectionToStr(prot),
-	//				node[i].Protection);
-	//		}
-	//		printf("\n");
-	//	}
-	//} __except (EXCEPTION_EXECUTE_HANDLER) {
-	//	printf("Exception when reading memory: 0x%lx\n", GetExceptionCode());
-	//}
-
-	return;
 }
 // -----------------------------------------------------------------
 void UpdateInitData(const char* sourceProcess,
@@ -866,13 +1049,13 @@ void UpdateInitData(const char* sourceProcess,
 	PINIT Data = (PINIT)SymbolsArray;
 	if (sourceProcess != NULL) {
 		size_t copyLenSource = min(strlen(sourceProcess), sizeof(Data[0].sourceProcess) - 1);
+		memset(Data[0].sourceProcess, 0, sizeof(Data[0].sourceProcess));
 		memcpy(Data[0].sourceProcess, sourceProcess, copyLenSource);
-		Data[0].sourceProcess[15] = '\0';
 	}
 	if (targetProcess != NULL) {
 		size_t copyLenTarget = min(strlen(targetProcess), sizeof(Data[0].targetProcess) - 1);
+		memset(Data[0].targetProcess, 0, sizeof(Data[0].targetProcess));
 		memcpy(Data[0].targetProcess, targetProcess, copyLenTarget);
-		Data[0].targetProcess[15] = '\0';
 	}
 	if (sourceVA != 0x0)
 		Data[0].sourceVA = sourceVA;
@@ -912,10 +1095,16 @@ void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
 	unsigned long long MMVADSubsection = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"Subsection");
 	unsigned long long MMVADControlArea = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD", L"ControlArea"); // actually at Off: 0x0 and its _CONTROL_AREA*
 	unsigned long long MMVADCAFilePointer = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"FilePointer");
+	unsigned long long MMCAFlags         = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"u");
+	unsigned long long MMCAMappedViews   = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"NumberOfMappedViews");
+	unsigned long long MMCAUserRefs      = GetFieldOffset(sym_ctxNtskrnl, "_CONTROL_AREA", L"NumberOfUserReferences");
+	GetAndInsertSymbol("MMVADSubsection",      sym_ctxNtskrnl, MMVADSubsection,    true);
+	GetAndInsertSymbol("MMVADControlArea",     sym_ctxNtskrnl, MMVADControlArea,   true);
+	GetAndInsertSymbol("MMVADCAFilePointer",   sym_ctxNtskrnl, MMVADCAFilePointer, true);
+	GetAndInsertSymbol("MMCAFlags",            sym_ctxNtskrnl, MMCAFlags,          true);
+	GetAndInsertSymbol("MMCAMappedViews",      sym_ctxNtskrnl, MMCAMappedViews,    true);
+	GetAndInsertSymbol("MMCAUserReferences",   sym_ctxNtskrnl, MMCAUserRefs,       true);
 	unsigned long long FILEOBJECTFileName = GetFieldOffset(sym_ctxNtskrnl, "_FILE_OBJECT", L"FileName");
-	GetAndInsertSymbol("MMVADSubsection", sym_ctxNtskrnl, MMVADSubsection, true);
-	GetAndInsertSymbol("MMVADControlArea", sym_ctxNtskrnl, MMVADControlArea, true);
-	GetAndInsertSymbol("MMVADCAFilePointer", sym_ctxNtskrnl, MMVADCAFilePointer, true);
 	GetAndInsertSymbol("FILEOBJECTFileName", sym_ctxNtskrnl, FILEOBJECTFileName, true);
 	unsigned long long EPROCImageFileName = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS", L"ImageFileName");
 	GetAndInsertSymbol("EPROCImageFileName", sym_ctxNtskrnl, EPROCImageFileName, true);
@@ -931,6 +1120,77 @@ void AddInitDataSection(symbol_ctx* sym_ctxNtskrnl) {
 	GetAndInsertSymbol("LdrListEntry", sym_ctxNtskrnl, LdrListEntry, true);
 	GetAndInsertSymbol("LdrBaseDllName", sym_ctxNtskrnl, LdrBaseDllName, true);
 	GetAndInsertSymbol("LdrBaseDllBase", sym_ctxNtskrnl, LdrBaseDllBase, true);
+
+	// AVL tree modification fields
+	unsigned long long ParentValue        = GetFieldOffset(sym_ctxNtskrnl, "_RTL_BALANCED_NODE", L"ParentValue");
+	unsigned long long AddressCreationLock = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS",          L"AddressCreationLock");
+	unsigned long long VadHint            = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS",          L"VadHint");
+	unsigned long long VadFreeHint        = GetFieldOffset(sym_ctxNtskrnl, "_EPROCESS",          L"VadFreeHint");
+	GetAndInsertSymbol("ParentValue",         sym_ctxNtskrnl, ParentValue,         true);
+	GetAndInsertSymbol("AddressCreationLock", sym_ctxNtskrnl, AddressCreationLock, true);
+	GetAndInsertSymbol("VadHint",             sym_ctxNtskrnl, VadHint,             true);
+	GetAndInsertSymbol("VadFreeHint",         sym_ctxNtskrnl, VadFreeHint,         true);
+
+	// Kernel MM internal helpers — absolute addresses (ntBase + PDB RVA)
+	unsigned long long MiCheckForConflictingVad = GetSymbolOffset(sym_ctxNtskrnl, "MiCheckForConflictingVad");
+	unsigned long long MiInsertVad              = GetSymbolOffset(sym_ctxNtskrnl, "MiInsertVad");
+	unsigned long long MiInsertVadCharges       = GetSymbolOffset(sym_ctxNtskrnl, "MiInsertVadCharges");
+	unsigned long long MiRemoveVad              = GetSymbolOffset(sym_ctxNtskrnl, "MiRemoveVad");
+	unsigned long long MiRemoveVadCharges       = GetSymbolOffset(sym_ctxNtskrnl, "MiRemoveVadCharges");
+	if (!MiInsertVad)
+		printf("[!] MiInsertVad not found in PDB — Mi* path will be skipped, manual AVL fallback active\n");
+	GetAndInsertSymbol("MiCheckForConflictingVad", sym_ctxNtskrnl, MiCheckForConflictingVad, false);
+	GetAndInsertSymbol("MiInsertVad",              sym_ctxNtskrnl, MiInsertVad,              false);
+	GetAndInsertSymbol("MiInsertVadCharges",       sym_ctxNtskrnl, MiInsertVadCharges,        false);
+	GetAndInsertSymbol("MiRemoveVad",              sym_ctxNtskrnl, MiRemoveVad,              false);
+	GetAndInsertSymbol("MiRemoveVadCharges",       sym_ctxNtskrnl, MiRemoveVadCharges,        false);
+
+	// ---- PDB-derived bitfield layouts ----------------------------------------
+	// Populate global decode tables for all MMVAD_FLAGS variants + _MMSECTION_FLAGS.
+	// These are used by ShowTree (usermode) and their bit-positions are also sent
+	// to the kernel via SYM_INFO so WalkVADIterative never uses hardcoded offsets.
+	g_MmVadFlags.count      = GetBitfieldMembers(sym_ctxNtskrnl, "_MMVAD_FLAGS",  g_MmVadFlags.members,  MAX_BITFIELD_MEMBERS);
+	g_MmVadFlags.valid      = g_MmVadFlags.count > 0;
+	g_MmVadFlags1.count     = GetBitfieldMembers(sym_ctxNtskrnl, "_MMVAD_FLAGS1", g_MmVadFlags1.members, MAX_BITFIELD_MEMBERS);
+	g_MmVadFlags1.valid     = g_MmVadFlags1.count > 0;
+	g_MmVadFlags2.count     = GetBitfieldMembers(sym_ctxNtskrnl, "_MMVAD_FLAGS2", g_MmVadFlags2.members, MAX_BITFIELD_MEMBERS);
+	g_MmVadFlags2.valid     = g_MmVadFlags2.count > 0;
+	g_MmSectionFlags.count  = GetBitfieldMembers(sym_ctxNtskrnl, "_MMSECTION_FLAGS", g_MmSectionFlags.members, MAX_BITFIELD_MEMBERS);
+	g_MmSectionFlags.valid  = g_MmSectionFlags.count > 0;
+
+	printf("[*] Bitfield layouts: _MMVAD_FLAGS=%u _MMVAD_FLAGS1=%u _MMVAD_FLAGS2=%u _MMSECTION_FLAGS=%u members\n",
+		g_MmVadFlags.count, g_MmVadFlags1.count, g_MmVadFlags2.count, g_MmSectionFlags.count);
+	if (g_MmVadFlags.count > 0) {
+		printf("[*] _MMVAD_FLAGS members:\n");
+		for (DWORD i = 0; i < g_MmVadFlags.count; i++)
+			printf("    [%2u] %-24s  bitPos=%2u  bitLen=%u\n", i,
+				g_MmVadFlags.members[i].name,
+				g_MmVadFlags.members[i].bitPos,
+				g_MmVadFlags.members[i].bitLen);
+	}
+	if (g_MmSectionFlags.count > 0) {
+		printf("[*] _MMSECTION_FLAGS members:\n");
+		for (DWORD i = 0; i < g_MmSectionFlags.count; i++)
+			printf("    [%2u] %-24s  bitPos=%2u  bitLen=%u\n", i,
+				g_MmSectionFlags.members[i].name,
+				g_MmSectionFlags.members[i].bitPos,
+				g_MmSectionFlags.members[i].bitLen);
+	}
+
+	// _MMVAD primary flags — _MMVAD_FLAGS contains VadType, Protection, PrivateMemory
+	// at the same bit positions for both _MMVAD_SHORT.Core.u and full _MMVAD.Core.u
+	unsigned long long MMVADFlagsOffset = GetFieldOffset(sym_ctxNtskrnl, "_MMVAD_SHORT", L"u");
+	GetAndInsertSymbol("MMVADFlagsOffset", sym_ctxNtskrnl, MMVADFlagsOffset, true);
+
+	const BITFIELD_LAYOUT* flPrimary = g_MmVadFlags.valid ? &g_MmVadFlags : NULL;
+	const BITFIELD_MEMBER* mProt    = flPrimary ? FindBitfieldMember(flPrimary->members, flPrimary->count, "Protection")    : NULL;
+	const BITFIELD_MEMBER* mVadType = flPrimary ? FindBitfieldMember(flPrimary->members, flPrimary->count, "VadType")        : NULL;
+	const BITFIELD_MEMBER* mPriv    = flPrimary ? FindBitfieldMember(flPrimary->members, flPrimary->count, "PrivateMemory")  : NULL;
+	GetAndInsertSymbol("ProtectionBitPos",    sym_ctxNtskrnl, mProt    ? mProt->bitPos    : 7,  true);
+	GetAndInsertSymbol("ProtectionBitLen",    sym_ctxNtskrnl, mProt    ? mProt->bitLen    : 5,  true);
+	GetAndInsertSymbol("VadTypeBitPos",       sym_ctxNtskrnl, mVadType ? mVadType->bitPos : 4,  true);
+	GetAndInsertSymbol("VadTypeBitLen",       sym_ctxNtskrnl, mVadType ? mVadType->bitLen : 3,  true);
+	GetAndInsertSymbol("PrivateMemoryBitPos", sym_ctxNtskrnl, mPriv    ? mPriv->bitPos    : 20, true);
 }
 
 // -----------------------------------------------------------------
@@ -1083,10 +1343,94 @@ bool ScanAndPrintMemory(const void* address, const char* hexPattern) {
 	//}
 }
 
+// -----------------------------------------------------------------
+// Prints the VAD tree as a numbered, indented list.
+// -----------------------------------------------------------------
+size_t ShowTree(PVOID SecBase, size_t SecSize,
+	PVOID FileNameSecBase, size_t FileNameSecSize,
+	unsigned long long* selectedVpns, size_t maxVpns) {
+	if (!SecBase) return 0;
+
+	PVAD_NODE      node     = (PVAD_NODE)SecBase;
+	PVAD_NODE_FILE fileBase = (PVAD_NODE_FILE)FileNameSecBase;
+	size_t maxNodes   = SecSize / sizeof(VAD_NODE);
+	size_t maxNames   = FileNameSecSize / sizeof(VAD_NODE_FILE);
+	size_t count      = 0;
+
+	printf("\n%-4s  %-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+		"#", "Lvl", "VADNode", "StartVpn", "EndVpn", "4KBs",
+		"Protection", "Type", "FileName");
+	printf("%-4s  %-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+		"---", "-----", "-----------------", "-------------", "-------------", "---------",
+		"--------------------------", "--------------", "-----------------------------------");
+
+	__try {
+		for (size_t i = 0; i < maxNodes - 1; i++) {
+			if (node[i].Level == 0) continue;
+
+			// Sentinel written by kernel for mode=2 (both) to separate sections
+			if (node[i].Level == -1 && node[i].StartingVpn == 0xFFFFFFFFFFFFFFFEULL) {
+				printf("\n  ---- [ Source Process ] -------------------------------------------------------------------------\n");
+				printf("%-4s  %-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+					"#", "Lvl", "VADNode", "StartVpn", "EndVpn", "4KBs",
+					"Protection", "Type", "FileName");
+				printf("%-4s  %-5s  %-18s  %-13s  %-13s  %-9s  %-26s  %-14s  %-35s\n",
+					"---", "-----", "-----------------", "-------------", "-------------", "---------",
+					"--------------------------", "--------------", "-----------------------------------");
+				continue;
+			}
+
+			unsigned long long vpn  = node[i].StartingVpn;
+			PROTECTION prot         = (PROTECTION)node[i].Protection;
+			const char* fileName    = (node[i].FileOffset && node[i].FileOffset < maxNames)
+									 ? fileBase[node[i].FileOffset].FileName : "-";
+
+			// Decode type tag from PDB-derived layout maps
+			char typeTag[48] = "";
+			if (g_MmSectionFlags.valid)
+				BuildVadTypeTag(node[i].VadFlagsRaw, node[i].ControlAreaFlags, node[i].IsVadShort,
+					node[i].MappedViews, node[i].UserReferences, typeTag, sizeof(typeTag));
+
+			// Protection string with raw value appended
+			char protBuf[40];
+			snprintf(protBuf, sizeof(protBuf), "%-22s [0x%x]",
+				ProtectionToStr(prot), node[i].Protection);
+
+			// indent by level with a leading symbol
+			char indent[32] = { 0 };
+			int d = (node[i].Level - 1) < 10 ? (node[i].Level - 1) : 10;
+			for (int j = 0; j < d; j++) indent[j] = ' ';
+			indent[d] = (node[i].Level == 1) ? '*' : (d % 2 == 0 ? '+' : '-');
+
+			printf("%-4zu  %s%-*d  0x%-16p  0x%011llx  0x%011llx  %-9llu  %-26s  %-14s  %-35s\n",
+				count,
+				indent, (int)(6 - (int)strlen(indent)), node[i].Level,
+				node[i].VADNode,
+				vpn, node[i].EndingVpn,
+				node[i].EndingVpn - vpn + 1,
+				protBuf,
+				typeTag,
+				fileName);
+
+			if (selectedVpns && count < maxVpns)
+				selectedVpns[count] = vpn;
+			count++;
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		printf("[!] Exception reading VAD data\n");
+	}
+	printf("\n[%zu nodes]\n", count);
+	return count;
+}
+
+// -----------------------------------------------------------------
 void ShowHelp() {
 	printf("---------------------------------------------------------------\n");
-	printf("[*] Press '1' to populate VAD-Tree\n");
-	printf("[*] Press '2' to check VAD offsets\n");
+	printf("[*] Press '1' to populate VAD-Tree  (T=Target / S=Source / B=Both)\n");
+	printf("[*] Press '2' to display VAD-Tree (quick view)\n");
+	printf("[*] Press 'T' to display VAD-Tree (indexed, for node selection)\n");
+	printf("[*] Press 'N' to insert a new VAD node\n");
+	printf("[*] Press 'D' to delete (remove) a VAD node\n");
 	printf("[*] Press '3' to check memory at source VA\n");
 	printf("[*] Press '4' to link to VAD-Tree Node\n");
 	printf("[*] Press '5' to exit with cleanup\n");
@@ -1111,7 +1455,7 @@ int main(int argc, char* argv[]) {
 	ntoskrnlPath = g_ntoskrnlPath;
 	symbol_ctx* sym_ctxNtskrnl = LoadSymbolsFromImageFile(ntoskrnlPath);
 
-	size_t NumSymbols = 7; // TODO Handle mapping size, currently its so few we'll stay below 1 page 4096 Bytes
+	size_t NumSymbols = 38; // total symbols inserted by AddInitDataSection
 	SymbolsArrayAllocationSize = sizeof(INIT);
 	SymbolsArrayAllocationSize += NumSymbols * sizeof(SYMBOL); // TODO: Change to new Var: TotalAllocationSize
 
@@ -1337,6 +1681,53 @@ int main(int argc, char* argv[]) {
 	printf("[*] ReadPhysical shared memory mapped successfully\n");
 	// TEST END
 
+	// VAD Modify section and events
+	HANDLE hVadModifyMapFile = OpenFileMappingW(SECTION_MAP_WRITE, FALSE, MAPPING_NAME_VAD_MODIFY);
+	if (!hVadModifyMapFile) {
+		printf("[-] Failed to open VAD modify mapping: %d\n", GetLastError());
+		return 1;
+	}
+	PVOID VadModifyArray = (VOID*)MapViewOfFile(hVadModifyMapFile, FILE_MAP_WRITE, 0, 0, 0);
+	if (!VadModifyArray) {
+		printf("[-] Failed to map VAD modify section: %d\n", GetLastError());
+		CloseHandle(hVadModifyMapFile);
+		return 1;
+	}
+	printf("[*] VAD modify shared memory mapped\n");
+
+	HANDLE hEventVAD_INSERT = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_VAD_INSERT_EVENT);
+	if (!hEventVAD_INSERT) {
+		printf("[-] Failed to open VAD insert event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] VAD insert event opened\n");
+
+	HANDLE hEventVAD_REMOVE = OpenEventW(EVENT_MODIFY_STATE, TRUE, MAPPING_NOTIFICATION_VAD_REMOVE_EVENT);
+	if (!hEventVAD_REMOVE) {
+		printf("[-] Failed to open VAD remove event: %d\n", GetLastError());
+		return 1;
+	}
+	printf("[*] VAD remove event opened\n");
+	// VAD modify setup END
+
+	printf("\n"
+		"[+] ============================================================\n"
+		"[+]  Shared memory regions (usermode VA)\n"
+		"[+] ============================================================\n"
+		"[+]  Input  (symbols/init)  : 0x%p\n"
+		"[+]  VAD nodes              : 0x%p  (%u KB)\n"
+		"[+]  VAD filenames          : 0x%p  (%u KB)\n"
+		"[+]  WritePhys request      : 0x%p\n"
+		"[+]  ReadPhys  request      : 0x%p\n"
+		"[+]  VAD modify request     : 0x%p\n"
+		"[+] ============================================================\n\n",
+		SymbolsArray,
+		VADArray,         (unsigned)(VAD_SECTION_SIZE      / 1024),
+		VADArrayFileName, (unsigned)(VAD_FILENAME_SEC_SIZE / 1024),
+		WritePhysArray,
+		ReadPhysArray,
+		VadModifyArray);
+
 	AddInitDataSection(sym_ctxNtskrnl);
 	UpdateInitData(sourceProcess, targetProcess, (unsigned long long)sourceVA, targetVPN, 0);
 	if (SetEvent(hEventINIT)) {
@@ -1391,6 +1782,11 @@ int main(int argc, char* argv[]) {
 	size_t pages;
 	bool continueScan = true;
 
+	// VAD tree node index (filled by 'T' command, used by 'D')
+#define VAD_MAX_NODES 512
+	unsigned long long treeVpns[VAD_MAX_NODES] = { 0 };
+	size_t treeCount = 0;
+
 	int protectionChoice;
 	ULONG newProtection;
 	const char* protectionName;
@@ -1406,21 +1802,35 @@ int main(int argc, char* argv[]) {
 
 			// Process the command
 			switch (ch) {
-			case '1':
-				RtlZeroMemory(VADArray, 4096 * 4);
-				RtlZeroMemory(VADArrayFileName, 4096 * 4);
-				if (targetProcess != NULL) {
-					if (SetEvent(hEventUSERMODEREADY)) { // TODO: Should all be CLI controlled? Like this we will always buffer the VAD-Tree
-						printf("[*] Notified driver to populate VAD-Tree\n");
-					}
-					else {
-						printf("[-] Failed to notified driver to populate VAD-Tree: %d\n", GetLastError());
-					}
+			case '1': {
+				printf("[*] Walk: T=Target  S=Source  B=Both [T]: ");
+				fflush(stdout);
+				int wch = _getch();
+				printf("%c\n", wch);
+				UCHAR wmode = (wch == 's' || wch == 'S') ? 1
+							: (wch == 'b' || wch == 'B') ? 2 : 0;
+				((PINIT)SymbolsArray)->walkMode = wmode;
+
+				RtlZeroMemory(VADArray, VAD_SECTION_SIZE);
+				RtlZeroMemory(VADArrayFileName, VAD_FILENAME_SEC_SIZE);
+
+				BOOL canWalk = (wmode == 1)
+					? (sourceProcess != NULL && sourceProcess[0] != '\0')
+					: (targetProcess != NULL && targetProcess[0] != '\0');
+				if (canWalk) {
+					if (SetEvent(hEventUSERMODEREADY))
+						printf("[*] Notified driver to populate VAD-Tree (mode=%s)\n",
+							wmode == 0 ? "target" : wmode == 1 ? "source" : "both");
+					else
+						printf("[-] Failed to notify driver: %d\n", GetLastError());
+				} else {
+					printf("[-] Required process not configured — use 'I' (source) or 'O' (target)\n");
 				}
 				break;
+			}
 			case '2':
 				printf("[*] VAD offsets:\n");
-				GetSymOffsets(VADArray, 4096 * 4, VADArrayFileName, 4096 * 4);
+				GetSymOffsets(VADArray, VAD_SECTION_SIZE, VADArrayFileName, VAD_FILENAME_SEC_SIZE);
 				break;
 			case '3':
 				printf("[*] Memory at source VA:\n");
@@ -1518,7 +1928,7 @@ int main(int argc, char* argv[]) {
 				RtlZeroMemory(procNameBufferSource, sizeof(procNameBufferSource));
 				procNameIndex = 0;
 
-				printf("Enter source process name (max 14 chars): ");
+				printf("Enter source process name (max 15 chars): ");
 				fflush(stdout);
 
 				// Read characters until Enter is pressed
@@ -1533,7 +1943,7 @@ int main(int argc, char* argv[]) {
 						}
 					}
 					// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
-					else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
+					else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 15) {
 						procNameBufferSource[procNameIndex++] = (char)inputChar;
 						printf("%c", inputChar); // Echo the character
 					}
@@ -1569,7 +1979,7 @@ int main(int argc, char* argv[]) {
 				RtlZeroMemory(procNameBufferTarget, sizeof(procNameBufferTarget));
 				procNameIndex = 0;
 
-				printf("Enter target process name (max 14 chars): ");
+				printf("Enter target process name (max 15 chars): ");
 				fflush(stdout);
 
 				// Read characters until Enter is pressed
@@ -1584,7 +1994,7 @@ int main(int argc, char* argv[]) {
 						}
 					}
 					// Only accept printable characters and limit to 14 chars (leaving space for null terminator)
-					else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 14) {
+					else if (inputChar >= 32 && inputChar <= 126 && procNameIndex < 15) {
 						procNameBufferTarget[procNameIndex++] = (char)inputChar;
 						printf("%c", inputChar); // Echo the character
 					}
@@ -1896,9 +2306,9 @@ int main(int argc, char* argv[]) {
 
 
 				SecBase = VADArray;
-				SecSize = 4096 * 4;
+				SecSize = VAD_SECTION_SIZE;
 				FileNameSecBase = VADArrayFileName;
-				FileNameSecSize = 4096 * 4;
+				FileNameSecSize = VAD_FILENAME_SEC_SIZE;
 				if (SecBase == NULL)
 					break;
 
@@ -1917,10 +2327,10 @@ int main(int argc, char* argv[]) {
 
 						prot = (PROTECTION)node[i].Protection;
 						protStr = ProtectionToStr(prot);
-						rangeSize = node[i].EndingVpn - node[i].StartingVpn;
+						rangeSize = node[i].EndingVpn - node[i].StartingVpn + 1;
 
 						currentVPN = node[i].StartingVpn;
-						pages = node[i].EndingVpn - node[i].StartingVpn;
+						pages = node[i].EndingVpn - node[i].StartingVpn + 1;
 
 						for (size_t currPage = 0; currPage < pages; currPage++) { // TODO: < or <= ?
 							if (!continueScan)
@@ -1949,17 +2359,13 @@ int main(int argc, char* argv[]) {
 				break;
 			case 'a':
 			case 'A':
-				// Present memory protection options
 				printf("[*] Select memory protection for sourceVA:\n");
-				printf("  1. PAGE_READONLY (0x01)\n");
-				printf("  2. PAGE_READWRITE (0x04)\n");
-				printf("  3. PAGE_WRITECOPY (0x07)\n");
-				printf("  4. PAGE_EXECUTE (0x10)\n");
-				printf("  5. PAGE_NOACCESS (0x18)\n");
-				printf("  6. PAGE_EXECUTE_READ (0x20)\n");
-				//printf("  6. PAGE_EXECUTE_READWRITE (0x40)\n");
-				//printf("  7. PAGE_EXECUTE_WRITECOPY (0x80)\n");
-				//printf("  8. PAGE_NOACCESS (0x01)\n");
+				printf("  1. PAGE_READONLY         (0x01)\n");
+				printf("  2. PAGE_EXECUTE          (0x02)\n");
+				printf("  3. PAGE_EXECUTE_READ     (0x03)\n");
+				printf("  4. PAGE_READWRITE        (0x04)\n");
+				printf("  5. PAGE_NOACCESS         (0x00)\n");
+				printf("  6. PAGE_EXECUTE_READWRITE(0x06)\n");
 
 				// Get user selection
 				protectionChoice = _getch() - '0';
@@ -1974,32 +2380,24 @@ int main(int argc, char* argv[]) {
 					protectionName = "PAGE_READONLY";
 					break;
 				case 2:
-					newProtection = PAGE_READWRITE;
-					protectionName = "PAGE_READWRITE";
-					break;
-				case 3:
-					newProtection = PAGE_WRITECOPY;
-					protectionName = "PAGE_WRITECOPY";
-					break;
-				case 4:
 					newProtection = PAGE_EXECUTE;
 					protectionName = "PAGE_EXECUTE";
 					break;
-				case 5:
+				case 3:
 					newProtection = PAGE_EXECUTE_READ;
 					protectionName = "PAGE_EXECUTE_READ";
+					break;
+				case 4:
+					newProtection = PAGE_READWRITE;
+					protectionName = "PAGE_READWRITE";
+					break;
+				case 5:
+					newProtection = PAGE_NOACCESS;
+					protectionName = "PAGE_NOACCESS";
 					break;
 				case 6:
 					newProtection = PAGE_EXECUTE_READWRITE;
 					protectionName = "PAGE_EXECUTE_READWRITE";
-					break;
-				case 7:
-					newProtection = PAGE_EXECUTE_WRITECOPY;
-					protectionName = "PAGE_EXECUTE_WRITECOPY";
-					break;
-				case 8:
-					newProtection = PAGE_NOACCESS;
-					protectionName = "PAGE_NOACCESS";
 					break;
 				default:
 					printf("[-] Invalid selection\n");
@@ -2360,6 +2758,253 @@ int main(int argc, char* argv[]) {
 				}
 				break;
 			}
+			// -------------------------------------------------------
+			// 'T' — indexed tree view (enables node selection for 'D')
+			// -------------------------------------------------------
+			case 't':
+			case 'T':
+				treeCount = ShowTree(VADArray, VAD_SECTION_SIZE, VADArrayFileName, VAD_FILENAME_SEC_SIZE,
+					treeVpns, VAD_MAX_NODES);
+				if (treeCount == 0)
+					printf("[!] Tree is empty — run '1' first to populate\n");
+				break;
+
+			// -------------------------------------------------------
+			// 'D' — delete (remove) a VAD node from the target process
+			// -------------------------------------------------------
+			case 'd':
+			case 'D': {
+				unsigned long long removeVpn = 0;
+				int freeChoice = 'N';
+
+				// If tree index exists let the user pick by number, else enter VPN directly
+				if (treeCount > 0) {
+					printf("Select node by index (0-%zu) or press Enter to type a VPN: ", treeCount - 1);
+					fflush(stdout);
+					memset(inputBuffer, 0, sizeof(inputBuffer));
+					inputIndex = 0;
+					while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+						if (inputChar == '\b' && inputIndex > 0) {
+							inputBuffer[--inputIndex] = 0;
+							printf("\b \b");
+						} else if (inputChar >= '0' && inputChar <= '9' && inputIndex < (int)sizeof(inputBuffer) - 1) {
+							inputBuffer[inputIndex++] = (char)inputChar;
+							printf("%c", inputChar);
+						}
+					}
+					printf("\n");
+					inputBuffer[inputIndex] = 0;
+					if (inputIndex > 0) {
+						size_t idx = (size_t)strtoull(inputBuffer, NULL, 10);
+						if (idx < treeCount) {
+							removeVpn = treeVpns[idx];
+							printf("[*] Selected node #%zu: StartingVpn 0x%llx\n", idx, removeVpn);
+						} else {
+							printf("[-] Index out of range\n");
+							break;
+						}
+					}
+				}
+
+				if (removeVpn == 0) {
+					printf("Enter StartingVpn to remove (hex): 0x");
+					fflush(stdout);
+					memset(inputBuffer, 0, sizeof(inputBuffer));
+					inputIndex = 0;
+					while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+						if (inputChar == '\b' && inputIndex > 0) {
+							inputBuffer[--inputIndex] = 0;
+							printf("\b \b");
+						} else if (isxdigit(inputChar) && inputIndex < (int)sizeof(inputBuffer) - 1) {
+							inputBuffer[inputIndex++] = (char)inputChar;
+							printf("%c", inputChar);
+						}
+					}
+					printf("\n");
+					inputBuffer[inputIndex] = 0;
+					if (inputIndex == 0) { printf("[-] No VPN entered\n"); break; }
+					removeVpn = strtoull(inputBuffer, NULL, 16);
+				}
+
+				printf("Free pool allocation after unlink? (Y/N): ");
+				fflush(stdout);
+				freeChoice = _getch();
+				printf("%c\n", freeChoice);
+
+				{
+					PVAD_MODIFY_REQUEST vadReq = (PVAD_MODIFY_REQUEST)VadModifyArray;
+					memset(vadReq, 0, sizeof(VAD_MODIFY_REQUEST));
+					memcpy(vadReq->identifier, "VREM", 4);
+					vadReq->StartingVpn  = removeVpn;
+					vadReq->FreeOnRemove = (freeChoice == 'Y' || freeChoice == 'y') ? TRUE : FALSE;
+					vadReq->isValid      = TRUE;
+
+					if (SetEvent(hEventVAD_REMOVE)) {
+						printf("[*] Sent VAD remove request for VPN 0x%llx\n", removeVpn);
+						Sleep(300);
+						printf("[*] Kernel result: 0x%08lx\n", vadReq->Result);
+					} else {
+						printf("[-] Failed to signal VAD remove event: %d\n", GetLastError());
+					}
+				}
+				break;
+			}
+
+			// -------------------------------------------------------
+			// 'N' — insert a new (ghost) VAD node into the target process
+			// -------------------------------------------------------
+			case 'n':
+			case 'N': {
+				unsigned long long newStart = 0, newEnd = 0;
+				ULONG newProt = 0x04;
+				ULONG vadType = 0;
+
+				// ── Step 1: QHNT — query next free VPN in both address spaces ─
+				{
+					UCHAR curWalkMode = ((PINIT)SymbolsArray)->walkMode;
+					const char* activeProc = (curWalkMode == 1)
+						? (sourceProcess ? sourceProcess : "(source not set)")
+						: (targetProcess ? targetProcess : "(target not set)");
+
+					PVAD_MODIFY_REQUEST qReq = (PVAD_MODIFY_REQUEST)VadModifyArray;
+					memset(qReq, 0, sizeof(VAD_MODIFY_REQUEST));
+					memcpy(qReq->identifier, "QHNT", 4);
+					qReq->isValid = TRUE;
+
+					if (SetEvent(hEventVAD_INSERT)) {
+						Sleep(300);
+						if (!qReq->isValid) {
+							printf("[+] Active process (%s): '%s'\n",
+								curWalkMode == 1 ? "source" : "target", activeProc);
+
+							if (qReq->SuggestedUserVpn || qReq->SuggestedKernelVpn) {
+								printf("[+] Suggested free VPN slots:\n");
+								if (qReq->SuggestedUserVpn)
+									printf("    [U] User-mode  : 0x%016llx  (VA 0x%016llx)\n",
+										qReq->SuggestedUserVpn,   qReq->SuggestedUserVpn   * 0x1000ULL);
+								if (qReq->SuggestedKernelVpn)
+									printf("    [K] Kernel-mode: 0x%016llx  (VA 0x%016llx)\n",
+										qReq->SuggestedKernelVpn, qReq->SuggestedKernelVpn * 0x1000ULL);
+								printf("    [M] Enter manually\n");
+								printf("    Choice [U/K/M]: ");
+								fflush(stdout);
+								int hintChoice = _getch();
+								printf("%c\n", hintChoice);
+								if ((hintChoice == 'u' || hintChoice == 'U') && qReq->SuggestedUserVpn)
+									newStart = qReq->SuggestedUserVpn;
+								else if ((hintChoice == 'k' || hintChoice == 'K') && qReq->SuggestedKernelVpn)
+									newStart = qReq->SuggestedKernelVpn;
+								// else fall through to manual entry
+							} else {
+								printf("[!] No free VPN suggestion available (result=0x%08lx)\n",
+									(ULONG)qReq->Result);
+							}
+						} else {
+							printf("[!] QHNT timed out — no response from driver\n");
+						}
+					}
+				}
+
+				// ── Step 2: manual StartingVpn if no suggestion was chosen ─
+				if (newStart == 0) {
+					printf("Enter StartingVpn (hex): 0x");
+					fflush(stdout);
+					memset(inputBuffer, 0, sizeof(inputBuffer));
+					inputIndex = 0;
+					while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+						if (inputChar == '\b' && inputIndex > 0) {
+							inputBuffer[--inputIndex] = 0; printf("\b \b");
+						} else if (isxdigit(inputChar) && inputIndex < (int)sizeof(inputBuffer) - 1) {
+							inputBuffer[inputIndex++] = (char)inputChar; printf("%c", inputChar);
+						}
+					}
+					printf("\n"); inputBuffer[inputIndex] = 0;
+					if (inputIndex == 0) { printf("[-] No StartingVpn\n"); break; }
+					newStart = strtoull(inputBuffer, NULL, 16);
+					}
+
+					// ── Step 2b: page count (decimal) for both paths ──────────
+					{
+						printf("Enter region size in pages (decimal, 1 page = 4 KB): ");
+						fflush(stdout);
+						memset(inputBuffer, 0, sizeof(inputBuffer));
+						inputIndex = 0;
+						while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+							if (inputChar == '\b' && inputIndex > 0) {
+								inputBuffer[--inputIndex] = 0; printf("\b \b");
+							} else if (isdigit(inputChar) && inputIndex < (int)sizeof(inputBuffer) - 1) {
+								inputBuffer[inputIndex++] = (char)inputChar; printf("%c", inputChar);
+							}
+						}
+						printf("\n"); inputBuffer[inputIndex] = 0;
+						unsigned long long sizePgs = (inputIndex > 0) ? strtoull(inputBuffer, NULL, 10) : 0;
+						if (sizePgs == 0) sizePgs = 1;
+						newEnd = newStart + sizePgs - 1;
+						printf("[*] Region: VPN 0x%llx - 0x%llx  (%llu page(s), %llu KB)\n",
+							newStart, newEnd, sizePgs, sizePgs * 4);
+					}
+
+					// ── Step 3: protection ─────────────────────────────────────
+					printf("Protection (hex MMVAD, e.g. 04=RW 01=RO 03=RX 07=RWX) [04]: 0x");
+					fflush(stdout);
+					memset(inputBuffer, 0, sizeof(inputBuffer));
+					inputIndex = 0;
+				while ((inputChar = _getch()) != '\r' && inputChar != '\n') {
+					if (inputChar == '\b' && inputIndex > 0) {
+						inputBuffer[--inputIndex] = 0; printf("\b \b");
+					} else if (isxdigit(inputChar) && inputIndex < (int)sizeof(inputBuffer) - 1) {
+						inputBuffer[inputIndex++] = (char)inputChar; printf("%c", inputChar);
+					}
+				}
+				printf("\n"); inputBuffer[inputIndex] = 0;
+				if (inputIndex > 0) newProt = (ULONG)strtoul(inputBuffer, NULL, 16);
+				vadType = ((newProt & 0x1F) << 7) | (1 << 20);
+
+				// ── Step 4: send VINS ──────────────────────────────────────
+				{
+					UCHAR curWalkMode = ((PINIT)SymbolsArray)->walkMode;
+					const char* activeProc = (curWalkMode == 1)
+						? (sourceProcess ? sourceProcess : "(source not set)")
+						: (targetProcess ? targetProcess : "(target not set)");
+
+					PVAD_MODIFY_REQUEST vadReq = (PVAD_MODIFY_REQUEST)VadModifyArray;
+					memset(vadReq, 0, sizeof(VAD_MODIFY_REQUEST));
+					memcpy(vadReq->identifier, "VINS", 4);
+					vadReq->StartingVpn = newStart;
+					vadReq->EndingVpn   = newEnd;
+					vadReq->Protection  = newProt;
+					vadReq->VadTypeRaw  = vadType;
+					vadReq->NodeSize    = 0;
+					vadReq->isValid     = TRUE;
+
+					printf("[*] Inserting into %s process: '%s'\n",
+						curWalkMode == 1 ? "source" : "target", activeProc);
+					printf("[*] VPN 0x%llx-0x%llx  (VA 0x%llx-0x%llx)  prot=0x%lx flags=0x%lx\n",
+						newStart, newEnd,
+						newStart * 0x1000ULL, (newEnd + 1) * 0x1000ULL - 1,
+						newProt, vadType);
+
+					if (SetEvent(hEventVAD_INSERT)) {
+						printf("[*] Sent VAD insert request\n");
+						Sleep(300);
+						LONG insertResult = vadReq->Result;
+						printf("[*] Kernel result: 0x%08lx\n", (ULONG)insertResult);
+						if (insertResult == 0) {
+							// Auto-refresh the same tree the insert went into
+							printf("[+] Success — refreshing %s tree\n",
+								curWalkMode == 1 ? "source" : "target");
+							RtlZeroMemory(VADArray, VAD_SECTION_SIZE);
+							RtlZeroMemory(VADArrayFileName, VAD_FILENAME_SEC_SIZE);
+							if (SetEvent(hEventUSERMODEREADY))
+								printf("[*] Tree refresh triggered\n");
+						}
+					} else {
+						printf("[-] Failed to signal VAD insert event: %d\n", GetLastError());
+					}
+				}
+				break;
+			}
+
 			default:
 				printf("Unknown command '%c'. Try:\n", ch);
 				ShowHelp();
@@ -2396,6 +3041,20 @@ cleanup:
 	}
 	if (hEventREAD_PHYS) {
 		CloseHandle(hEventREAD_PHYS);
+	}
+
+	// Cleanup VAD Modify resources
+	if (VadModifyArray) {
+		UnmapViewOfFile(VadModifyArray);
+	}
+	if (hVadModifyMapFile) {
+		CloseHandle(hVadModifyMapFile);
+	}
+	if (hEventVAD_INSERT) {
+		CloseHandle(hEventVAD_INSERT);
+	}
+	if (hEventVAD_REMOVE) {
+		CloseHandle(hEventVAD_REMOVE);
 	}
 
 	return 0;
